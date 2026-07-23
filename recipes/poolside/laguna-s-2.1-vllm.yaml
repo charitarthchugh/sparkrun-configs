@@ -8,6 +8,10 @@ container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
 metadata:
   description: Laguna-S-2.1 NVFP4 serving on one DGX Spark
   quantization: nvfp4
+  model_params: 117.6B
+  model_dtype: nvfp4
+  model_vram: 71
+  kv_dtype: fp8
 
 defaults:
   port: 8000
