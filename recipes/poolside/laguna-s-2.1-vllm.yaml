@@ -1,0 +1,28 @@
+recipe_version: "2"
+model: poolside/Laguna-S-2.1-NVFP4
+runtime: vllm
+min_nodes: 4
+container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
+
+metadata:
+  description: Laguna-S-2.1 NVFP4 serving with vLLM across four DGX Spark nodes
+  quantization: nvfp4
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.8
+  max_model_len: 32768
+
+command: |
+  vllm serve {model} \
+    --tensor-parallel-size {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --tool-call-parser poolside_v1 \
+    --reasoning-parser poolside_v1 \
+    --enable-auto-tool-choice \
+    --default-chat-template-kwargs '{"enable_thinking": true}' \
+    --host {host} \
+    --port {port}

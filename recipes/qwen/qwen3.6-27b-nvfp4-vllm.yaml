@@ -1,0 +1,27 @@
+recipe_version: "2"
+model: nvidia/Qwen3.6-27B-NVFP4
+runtime: vllm
+container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
+
+metadata:
+  description: Qwen3.6-27B NVFP4 serving with vLLM and NVIDIA ModelOpt
+  model_params: 27B
+  model_dtype: nvfp4
+  quantization: nvfp4
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 32768
+
+command: |
+  vllm serve {model} \
+    --quantization modelopt \
+    --reasoning-parser qwen3 \
+    --max-model-len {max_model_len} \
+    --tensor-parallel-size {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --host {host} \
+    --port {port}
