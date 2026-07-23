@@ -1,0 +1,9 @@
+registries:
+  - name: charitarth
+    description: Charitarth's personal Sparkrun recipes
+    recipes: recipes
+    tuning: tuning
+    benchmarks: benchmarking
+    mods: mods
+    enabled: true
+    visible: true
