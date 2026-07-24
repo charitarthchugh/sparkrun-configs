@@ -1,15 +1,16 @@
-model: bottlecapai/ThinkingCap-Qwen3.6-27B
+model: bottlecapai/ThinkingCap-Qwen3.6-27B-FP8
 runtime: vllm-distributed
 min_nodes: 1
 max_nodes: 1
 container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5:latest
 
 metadata:
-  description: BottleCap AI ThinkingCap Qwen3.6 27B for token-efficient reasoning
+  description: BottleCap AI ThinkingCap Qwen3.6 27B FP8 for token-efficient reasoning
   maintainer: Charitarth
   model_params: 27B
-  model_dtype: bf16
+  model_dtype: fp8
   kv_dtype: fp8
+  quantization: fp8
 
 defaults:
   port: 8000
