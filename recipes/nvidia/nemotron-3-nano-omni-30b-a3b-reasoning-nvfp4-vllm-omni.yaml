@@ -24,8 +24,16 @@ defaults:
   served_model_name: nemotron-3-nano-omni-nvfp4
 
 command: |
+  model_snapshot="$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download(\"nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4\", local_files_only=True))")" && \
+  runtime_model_dir="$(mktemp -d /tmp/nemotron-nano-omni.XXXXXX)" && \
+  for source_file in "$model_snapshot"/*; do \
+    case "$source_file" in \
+      *.safetensors) ln -s "$source_file" "$runtime_model_dir/" ;; \
+      *) cp -L "$source_file" "$runtime_model_dir/" ;; \
+    esac; \
+  done && \
   python3 -m pip install "vllm[audio]" && \
-  vllm serve {model} \
+  vllm serve "$runtime_model_dir" \
     --served-model-name {served_model_name} \
     --host {host} \
     --port {port} \
