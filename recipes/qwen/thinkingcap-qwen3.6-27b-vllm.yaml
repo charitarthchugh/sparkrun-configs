@@ -9,6 +9,7 @@ metadata:
   maintainer: Charitarth
   model_params: 27B
   model_dtype: bf16
+  kv_dtype: fp8
 
 defaults:
   port: 8000
@@ -22,6 +23,7 @@ command: |
   vllm serve \
       {model} \
       --served-model-name {served_model_name} \
+      --kv-cache-dtype fp8 \
       --max-model-len {max_model_len} \
       --gpu-memory-utilization {gpu_memory_utilization} \
       -tp {tensor_parallel} \
