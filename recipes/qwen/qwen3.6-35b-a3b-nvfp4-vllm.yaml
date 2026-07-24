@@ -1,0 +1,33 @@
+model: nvidia/Qwen3.6-35B-A3B-NVFP4
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5:latest
+
+metadata:
+  description: NVIDIA Qwen3.6 35B-A3B NVFP4 with vLLM and ModelOpt quantization
+  maintainer: Charitarth
+  model_params: 35B
+  model_dtype: nvfp4
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  served_model_name: qwen3.6-35b-a3b-nvfp4
+
+command: |
+  vllm serve \
+      {model} \
+      --served-model-name {served_model_name} \
+      --quantization modelopt \
+      --kv-cache-dtype fp8 \
+      --max-model-len {max_model_len} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --host {host} \
+      --port {port} \
+      --reasoning-parser qwen3 \
+      --trust-remote-code
