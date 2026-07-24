@@ -20,6 +20,7 @@ command: |
   vllm serve {model} \
     --quantization modelopt \
     --reasoning-parser qwen3 \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
     --max-model-len {max_model_len} \
     --tensor-parallel-size {tensor_parallel} \
     --gpu-memory-utilization {gpu_memory_utilization} \

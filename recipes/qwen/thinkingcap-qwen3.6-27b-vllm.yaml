@@ -30,4 +30,5 @@ command: |
       --host {host} \
       --port {port} \
       --reasoning-parser qwen3 \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
       --trust-remote-code
