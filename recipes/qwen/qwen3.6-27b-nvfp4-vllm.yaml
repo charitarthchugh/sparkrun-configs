@@ -1,4 +1,4 @@
-description: NVIDIA Qwen3.6-27B NVFP4 ModelOpt checkpoint on a single DGX Spark — the max-throughput multimodal profile (vision tower kept, not language-model-only) with FP8 KV, built-in MTP k=3, and async scheduling. DGX Spark unified memory is 127.6 GB and vLLM's gpu_memory_utilization claims host RAM rather than a separate VRAM pool, so the usual "give the GPU most of the box" instinct is wrong here. 0.85 with an unbounded context OOMs the whole node, and even 0.7 (74 GiB of KV) leaves only ~3 GB free once FlashInfer autotuning allocates its workspace. 0.5 with an explicit max_model_len still yields far more KV than this context needs while leaving the host comfortable alongside the vision tower and multimodal activation buffers.
+description: NVIDIA Qwen3.6-27B NVFP4 ModelOpt checkpoint on a single DGX Spark — the max-throughput multimodal profile (vision tower kept, not language-model-only) with FP8 KV, built-in MTP k=3, and async scheduling. DGX Spark unified memory is 127.6 GB and vLLM's gpu_memory_utilization claims host RAM rather than a separate VRAM pool, so the usual "give the GPU most of the box" instinct is wrong here. 0.85 with an unbounded context OOMs the whole node, and even 0.7 (74 GiB of KV) leaves only ~3 GB free once FlashInfer autotuning allocates its workspace. 0.5 leaves the host comfortable alongside the vision tower and multimodal activation buffers while still allocating ~49.5 GiB of KV, enough to serve the checkpoint's full native 262144-token context (text_config.max_position_embeddings, no rope scaling) at roughly 4x concurrency.
 model: nvidia/Qwen3.6-27B-NVFP4
 container: eugr/spark-vllm:latest
 mods: []
@@ -7,7 +7,7 @@ defaults:
   host: 0.0.0.0
   tensor_parallel: 1
   gpu_memory_utilization: 0.5
-  max_model_len: 65536
+  max_model_len: 262144
   max_num_batched_tokens: 32768
   max_num_seqs: 16
   limit_mm_per_prompt: '{"image": 1, "video": 0}'
