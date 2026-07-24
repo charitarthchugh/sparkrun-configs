@@ -3,7 +3,7 @@ model: poolside/Laguna-S-2.1-NVFP4
 runtime: vllm-distributed
 min_nodes: 1
 max_nodes: 1
-container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
+container: vllm/vllm-openai:latest-cu130
 
 metadata:
   description: Laguna-S-2.1 NVFP4 serving on one DGX Spark
