@@ -1,17 +1,20 @@
-description: NVIDIA Qwen3.6-27B NVFP4 ModelOpt checkpoint on a single DGX Spark — the max-throughput multimodal profile (vision tower kept, not language-model-only) with FP8 KV, built-in MTP k=3, and async scheduling, reconciled against the official vLLM DGX Spark recipe and the NVIDIA Spark benchmark thread. gpu_memory_utilization raised to 0.85 to hold the vision tower + multimodal activation buffers alongside the NVFP4 weights.
+description: NVIDIA Qwen3.6-27B NVFP4 ModelOpt checkpoint on a single DGX Spark — the max-throughput multimodal profile (vision tower kept, not language-model-only) with FP8 KV, built-in MTP k=3, and async scheduling. DGX Spark unified memory is 127.6 GB and vLLM's gpu_memory_utilization claims host RAM, not a separate VRAM pool, so 0.85 with an unbounded context takes the whole node down; 0.7 plus an explicit max_model_len keeps the vision tower and multimodal activation buffers resident alongside the NVFP4 weights with headroom for the host.
 model: nvidia/Qwen3.6-27B-NVFP4
-container: vllm/vllm-omni:latest-aarch64
+container: eugr/spark-vllm:latest
 mods: []
 defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 1
-  gpu_memory_utilization: 0.85
+  gpu_memory_utilization: 0.7
+  max_model_len: 65536
   max_num_batched_tokens: 32768
   max_num_seqs: 16
+  limit_mm_per_prompt: '{"image": 1, "video": 0}'
   served_model_name: qwen3.6-27b
+  speculative_config: '{"method":"mtp","num_speculative_tokens":3}'
 env:
-  MAX_JOBS: '4'
+  MAX_JOBS: '2'
   NVCC_THREADS: '2'
   FLASHINFER_NVCC_THREADS: '2'
   CUTE_DSL_ARCH: sm_121a
@@ -28,15 +31,17 @@ command: |
     --load-format fastsafetensors \
     --kv-cache-dtype fp8 \
     --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
     --max-num-batched-tokens {max_num_batched_tokens} \
     --max-num-seqs {max_num_seqs} \
+    --limit-mm-per-prompt '{limit_mm_per_prompt}' \
     --enable-chunked-prefill \
     --async-scheduling \
     --enable-prefix-caching \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
     --reasoning-parser qwen3 \
-    --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+    --speculative-config '{speculative_config}'
 recipe_version: "2"
 name: Qwen3.6-27B-NVFP4-NVIDIA-DGX-Spark
 cluster_only: false
