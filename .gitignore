@@ -7,3 +7,7 @@
 .cache/
 .vscode/
 .idea/
+
+# agent tooling scratch (session logs, state, plugin caches)
+.omc/
+.superpowers/

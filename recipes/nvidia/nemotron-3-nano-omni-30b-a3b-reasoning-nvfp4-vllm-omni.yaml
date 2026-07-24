@@ -3,7 +3,7 @@ model: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
 runtime: vllm-distributed
 min_nodes: 1
 max_nodes: 1
-container: vllm/vllm-omni:latest
+container: vllm/vllm-omni:latest-aarch64
 
 metadata:
   description: NVIDIA Nemotron 3 Nano Omni NVFP4 serving with vLLM-Omni
