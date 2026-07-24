@@ -1,0 +1,53 @@
+recipe_version: "2"
+model: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: vllm/vllm-omni:latest
+
+metadata:
+  description: NVIDIA Nemotron 3 Nano Omni NVFP4 serving with vLLM-Omni
+  model_params: 31B
+  model_dtype: nvfp4
+  model_vram: 21
+  kv_dtype: fp8
+  quantization: nvfp4
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 131072
+  max_num_batched_tokens: 32768
+  max_num_seqs: 8
+  served_model_name: nemotron-3-nano-omni-nvfp4
+
+command: |
+  model_snapshot="$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download(\"nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4\", local_files_only=True))")" && \
+  runtime_model_dir="$(mktemp -d /tmp/nemotron-nano-omni.XXXXXX)" && \
+  for source_file in "$model_snapshot"/*; do \
+    case "$source_file" in \
+      *.safetensors) ln -s "$source_file" "$runtime_model_dir/" ;; \
+      *) cp -L "$source_file" "$runtime_model_dir/" ;; \
+    esac; \
+  done && \
+  python3 -m pip install "vllm[audio]" && \
+  vllm serve "$runtime_model_dir" \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --kv-cache-dtype fp8 \
+    --trust-remote-code \
+    --video-pruning-rate 0.5 \
+    --limit-mm-per-prompt '{"video": 1, "image": 1, "audio": 1}' \
+    --media-io-kwargs '{"video": {"fps": 2, "num_frames": 256}}' \
+    --enable-prefix-caching \
+    --reasoning-parser nemotron_v3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder
