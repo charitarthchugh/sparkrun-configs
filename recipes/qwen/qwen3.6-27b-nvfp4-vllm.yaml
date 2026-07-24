@@ -1,17 +1,15 @@
-description: NVIDIA Qwen3.6-27B NVFP4 ModelOpt checkpoint on a single DGX Spark — the max-throughput text-serving profile (FP8 KV, built-in MTP k=3, async scheduling) reconciled against the official vLLM DGX Spark recipe and the NVIDIA Spark benchmark thread.
+description: NVIDIA Qwen3.6-27B NVFP4 ModelOpt checkpoint on a single DGX Spark — the max-throughput multimodal profile (vision tower kept, not language-model-only) with FP8 KV, built-in MTP k=3, and async scheduling, reconciled against the official vLLM DGX Spark recipe and the NVIDIA Spark benchmark thread. gpu_memory_utilization raised to 0.85 to hold the vision tower + multimodal activation buffers alongside the NVFP4 weights.
 model: nvidia/Qwen3.6-27B-NVFP4
-container: vllm-node
+container: vllm/vllm-omni:latest-aarch64
 mods: []
 defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 1
-  gpu_memory_utilization: 0.5
-  max_model_len: 131072
+  gpu_memory_utilization: 0.85
   max_num_batched_tokens: 32768
-  max_num_seqs: 32
+  max_num_seqs: 16
   served_model_name: qwen3.6-27b
-  num_speculative_tokens: 3
 env:
   MAX_JOBS: '4'
   NVCC_THREADS: '2'
@@ -26,12 +24,10 @@ command: |
     --served-model-name {served_model_name} \
     --tensor-parallel-size {tensor_parallel} \
     --trust-remote-code \
-    --language-model-only \
     --quantization modelopt \
     --load-format fastsafetensors \
     --kv-cache-dtype fp8 \
     --gpu-memory-utilization {gpu_memory_utilization} \
-    --max-model-len {max_model_len} \
     --max-num-batched-tokens {max_num_batched_tokens} \
     --max-num-seqs {max_num_seqs} \
     --enable-chunked-prefill \
@@ -40,8 +36,8 @@ command: |
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
     --reasoning-parser qwen3 \
-    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
-recipe_version: '1'
+    --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+recipe_version: "2"
 name: Qwen3.6-27B-NVFP4-NVIDIA-DGX-Spark
 cluster_only: false
 solo_only: false
