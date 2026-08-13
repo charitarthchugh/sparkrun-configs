@@ -1,0 +1,116 @@
+recipe_version: "2"
+model: poolside/Laguna-S-2.1-NVFP4
+runtime: trtllm
+min_nodes: 1
+max_nodes: 1
+# DFlash drafter support landed in TensorRT-LLM via PR #15666 (merged 2026-07-14),
+# so the container must be >= 1.3.0rc20. Pinned to an rc with an arm64 variant on NGC.
+container: nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24
+
+metadata:
+  description: >-
+    Laguna-S-2.1 NVFP4 on one DGX Spark via trtllm-serve. The DFlash drafter is
+    wired up but commented out because it halves throughput here: 16.1 tok/s
+    with it off vs 8.3 tok/s with it on (400-token greedy completion, bs1).
+    Its drafts are never accepted — accepted tokens per iteration, where the
+    ideal is near draft_len+1, measured 1.058 at max_draft_len 7 on 1.3.0rc24,
+    1.047 at 15, and 1.047 at 7 on 1.3.0rc25.dev2026081200 — so every step
+    pays for a rejected draft pass plus ~2.2 GB of VRAM. Upstream validated
+    DFlash on Laguna-XS-2.1, not S-2.1. Re-enable the commented blocks below
+    to retest. Latency profile, not throughput — max_batch_size 1 matches the
+    vLLM recipe's max_num_seqs 1.
+  quantization: nvfp4
+  model_params: 117.6B
+  model_dtype: nvfp4
+  model_vram: 71
+  kv_dtype: fp8
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # Set to what the KV pool can actually back, not the checkpoint's native
+  # 262144. A request is only servable if the pool holds its whole context, and
+  # the pool measured 56608 tokens at kv_free_frac 0.9 (35296 at 0.6). 49152
+  # leaves headroom for the run-to-run variance in that figure. Advertising
+  # more would just move the failure from startup to request time.
+  max_model_len: 49152
+  served_model_name: laguna-s-2.1-nvfp4
+  # Prefill chunk size. Only meaningful because --enable_chunked_prefill is set:
+  # with chunked prefill off, TRT-LLM rejects any prompt longer than this
+  # outright ("prompt length ... should not exceed max_num_tokens"), which
+  # capped the advertised 131072 context at 16k.
+  max_num_tokens: 16384
+  max_batch_size: 1
+  # TRT-LLM semantics: fraction of memory *still free after weights load*, not
+  # vLLM's fraction-of-total. On GB10's unified memory the probe reports only
+  # only a few GB free after the 71 GB of weights, so this fraction is what
+  # actually bounds the KV pool: measured 35296 tokens at 0.6, 56608 at 0.9.
+  # Both this and kv_max_tokens are ceilings — TRT-LLM allocates the *minimum*
+  # of the two — so raising kv_max_tokens alone does nothing; this fraction is
+  # the only lever that grows the pool. 0.9 loaded without OOM here, but this
+  # box has a history of OOM kills during load (see 50-oomd-relax.conf), so
+  # back it off before suspecting anything else if a launch dies.
+  kv_free_frac: 0.9
+  # Ceiling only; sits above the measured pool so it never binds first.
+  kv_max_tokens: 65536
+  # --- DFlash drafter (disabled, see metadata.description) ---
+  # draft_model: poolside/Laguna-S-2.1-DFlash-NVFP4
+  # Model card recommends 7; the drafter is trained to a block size of 16.
+  # max_draft_len: 7
+
+env:
+  CUTE_DSL_ARCH: sm_121a
+  MAX_JOBS: "4"
+  # --- Required only when the drafter is re-enabled ---
+  # sparkrun only prefetches `model`; the trtllm runtime has no draft-model
+  # detection (unlike vllm-distributed/sglang), so the drafter is invisible to
+  # it and the default HF_HUB_OFFLINE=1 makes trtllm-serve die at startup.
+  # HF_HUB_OFFLINE: "0"
+  # TRANSFORMERS_OFFLINE: "0"
+
+# The reasoning parser is registered as 'laguna' at 1.3.0rc24; the 'poolside_v1'
+# alias for it only exists on newer builds. The *tool* parser is 'poolside_v1'.
+# The extra LLM API config is written here rather than generated from defaults,
+# because neither speculative_config nor kv_cache_config.max_tokens has a
+# sparkrun mapping. Passing --extra_llm_api_options explicitly also stops the
+# runtime from appending its own copy of the flag.
+#
+# Consequence worth knowing: because the flag is already present, sparkrun's
+# canonical extra-config keys are inert here. `-o free_gpu_memory_fraction=0.5`
+# writes /tmp/extra-llm-api-config.yml, which trtllm-serve never reads, and the
+# override is silently ignored. Override kv_free_frac / kv_max_tokens instead —
+# those are the keys this heredoc actually interpolates.
+command: |
+  cat > /tmp/laguna-dflash.yml <<'YAML_EOF'
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: {kv_free_frac}
+    max_tokens: {kv_max_tokens}
+    enable_block_reuse: true
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: {max_batch_size}
+  YAML_EOF
+  trtllm-serve {model} \
+    --backend pytorch \
+    --tp_size {tensor_parallel} \
+    --max_seq_len {max_model_len} \
+    --max_num_tokens {max_num_tokens} \
+    --max_batch_size {max_batch_size} \
+    --enable_chunked_prefill \
+    --served_model_name {served_model_name} \
+    --trust_remote_code \
+    --tool_parser poolside_v1 \
+    --reasoning_parser laguna \
+    --extra_llm_api_options /tmp/laguna-dflash.yml \
+    --host {host} \
+    --port {port}
+
+# To re-enable DFlash: uncomment the two defaults, the two env vars, and add
+# back to the heredoc above (as the first block, before kv_cache_config):
+#
+#   speculative_config:
+#     decoding_type: DFlash
+#     speculative_model: {draft_model}
+#     max_draft_len: {max_draft_len}
