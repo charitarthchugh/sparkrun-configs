@@ -1,0 +1,144 @@
+recipe_version: "2"
+model: poolside/Laguna-S-2.1-NVFP4
+# Tracks the RC1 branch by name rather than by SHA. Must stay in sync with
+# defaults.revision below, which pins the *serve* side — sparkrun does not
+# inject model_revision into the command's placeholder chain, so the two are
+# separate knobs.
+model_revision: RC1
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: eugr/spark-vllm:latest
+
+metadata:
+  description: >-
+    Laguna-S-2.1 NVFP4 on one DGX Spark, tracking the RC1 branch (head was
+    2a38deef, 2026-07-22 "remove orphaned released shards"). RC1 is the
+    spinquantless NVFP4 (norot W4A4 dynamic) 256K line: 15 shards, ~72 GB. Its
+    weights are byte-identical to the 07614121 commit on main's history — only
+    configuration_laguna.py, generation_config.json, tokenizer.json and
+    tokenizer_config.json differ — so this is that checkpoint running newer
+    remote code.
+
+    This is a *branch* pin, not a SHA pin, chosen for legibility: the content
+    will change if poolside pushes to RC1, with no guarantee the next push
+    keeps the same weights or tokenizer. If a launch suddenly behaves
+    differently, check the branch head before anything else. Pin the SHA when
+    you need reproducibility.
+
+    Because sparkrun sets HF_HUB_OFFLINE=1, vLLM resolves revisions out of the
+    local cache, and a branch name only resolves if the cache holds the ref.
+    The first fetch therefore has to be 'hf download poolside/Laguna-S-2.1-NVFP4
+    --revision RC1' — fetching the same commit by SHA populates the weights but
+    not refs/RC1, and the launch then fails despite the bytes being on disk.
+    The remote code (configuration_laguna.py) differs across these revisions,
+    so --code-revision matters as much as --revision.
+
+    Main was moved to the RC2 checkpoint on 2026-08-01 (1M context, 49 shards,
+    ~100 GB); this recipe stays off that line.
+
+    Watch out for generation_config.json here: it is 199 bytes and carries
+    "max_new_tokens": 8192 while dropping the reasoning_parser,
+    tool_call_parser and default_chat_template_kwargs entries that the main-line
+    checkpoints ship. The parsers are passed explicitly on the command line so
+    that part is covered, but if completions truncate at 8192 tokens, that cap
+    is the reason — override it with --override-generation-config rather than
+    hunting elsewhere.
+
+    DFlash uses drafter 4cdcc6e9 ("Spinquant removal adaptation", 2026-07-27),
+    the same pairing as the sibling pinned recipe, since the weights are the
+    same spinquantless line. Note HF discussion #25 has no data on this base at
+    all — every working config there pairs the main drafter with RC2 or RC3 —
+    so the pairing is an open experiment. num_speculative_tokens 7 is
+    poolside's recommendation in that thread; the only measurements there are
+    ~7 t/s at 15 and ~13 t/s at 3. --kv-cache-dtype fp8 is load-bearing rather
+    than just a memory saving: per that thread DFlash acceptance collapses
+    without it, suspected to be a vLLM mixed-precision defect.
+
+    Measured 2026-08-13 on this config: mean acceptance length 4.47 (ideal 8 at
+    7 draft tokens), avg draft acceptance 49.5%, per-position 0.839 0.661 0.500
+    0.419 0.387 0.355 0.306, 37.3 tok/s on a 318-token completion. KV cache
+    824,466 tokens, 3.15x concurrency at 262144; weights+drafter 69.26 GiB in
+    431 s. For contrast the trtllm sibling recipe measured ~1.05 accepted
+    tokens/iteration and gave up on DFlash. Three things differ between those
+    runs — engine, drafter revision, and kv-cache-dtype — so this does not by
+    itself prove the drafter pairing is what fixed it. Acceptance is still
+    0.306 at position 6, so 7 may not be the ceiling.
+
+    gpu_memory_utilization 0.85 with max_num_batched_tokens 2048 is set by
+    measurement, not preference. 0.92 with 16384 took the whole machine down:
+    the kernel logged repeated "NVRM: Out of memory [NV_ERR_NO_MEMORY]" once
+    the weights, the drafter and the profiling allocations had all landed, and
+    the node needed a hard restart. The trap is that on a Spark, unified memory
+    means gpu_memory_utilization sets *host* headroom, so it does not get safer
+    just because these ~72 GB checkpoints are smaller than the ~100 GB RC2 one
+    that discussion #25's OOM reports were about — 0.92 leaves ~10 GiB for host
+    plus container either way, and the drafter plus CUDA graphs do not fit in
+    it. 0.85 leaves ~18 GiB, and the KV cache still holds roughly 700K tokens,
+    comfortably above the 262144 context. Raise it only with a way to recover
+    the box.
+  quantization: nvfp4
+  model_params: 117.6B
+  model_dtype: nvfp4
+  model_vram: 72
+  kv_dtype: fp8
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # Keep in sync with the top-level model_revision.
+  revision: RC1
+  gpu_memory_utilization: 0.85
+  draft_model: poolside/Laguna-S-2.1-DFlash-NVFP4
+  draft_revision: 4cdcc6e9b29105e8ff5790885cadccbeb4f33f54
+  num_speculative_tokens: 7
+  max_model_len: 262144
+  served_model_name: laguna-s-2.1-nvfp4-rc1
+  max_num_batched_tokens: 2048
+  max_num_seqs: 1
+
+# The drafter is deliberately NOT in a distribution_config here. sparkrun's
+# single-localhost fast path (orchestration/distribution.py, the len(host_list)
+# <= 1 branch) collects entry *names* and downloads every one at the recipe's
+# top-level model_revision, dropping each entry's own revision — so listing the
+# drafter makes the launch die with "Invalid rev id <base sha>" against the
+# drafter repo. The multi-host path honors entry.revision correctly; this only
+# bites --tp 1. Pre-download the drafter by hand instead:
+#
+#   hf download poolside/Laguna-S-2.1-DFlash-NVFP4 \
+#     --revision 4cdcc6e9b29105e8ff5790885cadccbeb4f33f54
+#
+# vLLM then resolves it out of the local cache via the revision in
+# --speculative-config, which works under HF_HUB_OFFLINE=1.
+
+env:
+  CUTE_DSL_ARCH: sm_121a
+  MAX_JOBS: "4"
+  # From the working DGX Spark config in HF discussion #25, on this same
+  # eugr/spark-vllm build.
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+
+command: |
+  vllm serve {model} \
+    --revision {revision} \
+    --code-revision {revision} \
+    --tokenizer-revision {revision} \
+    --trust-remote-code \
+    --dtype auto \
+    --safetensors-load-strategy lazy \
+    --tensor-parallel-size {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --tool-call-parser poolside_v1 \
+    --reasoning-parser poolside_v1 \
+    --enable-auto-tool-choice \
+    --default-chat-template-kwargs '{"enable_thinking": true}' \
+    --speculative-config '{"method": "dflash", "model": "{draft_model}", "revision": "{draft_revision}", "code_revision": "{draft_revision}", "num_speculative_tokens": {num_speculative_tokens}}' \
+    --max-num-seqs {max_num_seqs} \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --kv-cache-dtype fp8 \
+    --host {host} \
+    --port {port}
