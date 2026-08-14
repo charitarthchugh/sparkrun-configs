@@ -88,9 +88,11 @@ metadata:
     that, because it derives nogds from tensor-parallel size alone
     (nogds = pg.size() > 1), so at --tp 1 it is always False with no override.
     The warning is harmless once the queue is serial. FASTSAFETENSORS_UNIFIED_MEM
-    is pinned to 0 because that is the combination measured; the unified-memory
-    copier (auto-enabled on a "gb10" device name) is untested against the serial
-    queue. If loading ever wedges the box again, --load-format auto is the safe
+    is pinned to 0 because that is the combination measured. The unified-memory
+    copier (UNIFIED_MEM=1, auto-enabled on a "gb10" device name) was tried on
+    the RC3 sibling and made things worse there — faster per shard, so it
+    exhausted memory sooner — which is why 0 is kept here rather than trusting
+    the auto-detection. If loading ever wedges the box again, --load-format auto is the safe
     fallback.
 
     This is checkpoint-specific, not a general Spark fix: the RC3 sibling still

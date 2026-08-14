@@ -51,7 +51,14 @@ metadata:
     unsupported here — "GDS is not supported in this platform but nogds is
     False" — and vLLM cannot act on that, deriving nogds from tensor-parallel
     size alone (nogds = pg.size() > 1), so at --tp 1 it is always False with no
-    override. Retest fastsafetensors only with a memory guard on the launch.
+    override. Three combinations were tried, all dying in the same place:
+    serial queue with FASTSAFETENSORS_UNIFIED_MEM=0 collapsed at shard 13 of 19
+    twice (105 s, 120 s), and UNIFIED_MEM=1 collapsed at shard 12 of 19 after
+    90 s. The unified copier is faster per shard (1.75-3.5 s/it vs 4.8) but
+    consumes memory proportionally faster, so it hits the wall sooner rather
+    than avoiding it. Every attempt fails around ~48 GB loaded where RC1
+    completes at ~72 GB, which is what points at this checkpoint's structure
+    rather than at the copier. Retest only with a memory guard on the launch.
 
     gpu_memory_utilization 0.85 with max_num_batched_tokens 2048 is set by
     measurement, not preference. The sibling RC1 recipe at 0.92 with 16384 took
