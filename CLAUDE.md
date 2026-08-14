@@ -22,6 +22,11 @@ sparkrun run recipes/qwen/qwen3.6-27b-nvfp4-vllm.yaml --solo --dry-run
 python scripts/validate_registry_manifest.py
 ```
 
+The `sparkrun@sparkrun` plugin (from the `spark-arena/sparkrun` marketplace) is enabled at project
+scope in `.claude/settings.json`, so its skills load for anyone working in this repo. Load the
+`sparkrun:run` skill before invoking any `sparkrun` CLI command rather than calling it through Bash
+directly.
+
 `.sparkrun/registry.yaml` is the manifest and must keep the exact key→value mappings that
 `scripts/validate_registry_manifest.py` enforces (`name: charitarth`, and the content-dir
 mappings `recipes`, `tuning`, `benchmarks: benchmarking`, `mods`, plus `enabled/visible: true`).
