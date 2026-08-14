@@ -73,13 +73,16 @@ metadata:
     DFlash uses the drafter's main (b3b5921). There is no RC3 drafter branch,
     but this exact pairing is the verified result in HF discussion #25: TeAmErX
     ran RC3 against b3b5921 and confirmed the hash, averaging ~13 t/s.
-    num_speculative_tokens 7 is poolside's recommendation in that thread; the
-    only measurements there are ~7 t/s at 15 and ~13 t/s at 3, so treat it as a
-    knob. --kv-cache-dtype fp8 is load-bearing rather than just a memory saving:
+    num_speculative_tokens is set to 3, not the 7 poolside recommend in that
+    thread: the only throughput numbers posted there are ~7 t/s at 15 and
+    ~13 t/s at 3, so the trend favours short drafts, and the per-position
+    acceptance measured here (below) is already under 0.45 by position 4 — the
+    last three drafted tokens at 7 were mostly wasted work. Treat it as a knob.
+    --kv-cache-dtype fp8 is load-bearing rather than just a memory saving:
     per the same thread DFlash acceptance collapses without it, suspected to be
     a vLLM mixed-precision defect.
 
-    Measured 2026-08-13 on this config: mean acceptance length 4.59, avg draft
+    Measured 2026-08-13 with num_speculative_tokens 7: mean acceptance length 4.59, avg draft
     acceptance 51.3%, per-position 0.857 0.661 0.536 0.446 0.393 0.375 0.321,
     37.1 tok/s on a 318-token completion. KV cache 824,466 tokens; weights plus
     drafter 69.73 GiB in 429 s. That is ~2.9x the ~13 t/s reported in the
@@ -116,7 +119,7 @@ defaults:
   # because poolside asked people to pin revisions explicitly.
   draft_model: poolside/Laguna-S-2.1-DFlash-NVFP4
   draft_revision: b3b5921a900b9e0a1e27e50bdaeb480692a6d19b
-  num_speculative_tokens: 7
+  num_speculative_tokens: 3
   max_model_len: 262144
   served_model_name: laguna-s-2.1-nvfp4-rc3
   max_num_batched_tokens: 2048
