@@ -35,6 +35,24 @@ metadata:
     single 1M-token request would not fit. 262144 leaves headroom and matches
     the sibling recipe.
 
+    --load-format fastsafetensors is deliberately NOT used here, unlike the RC1
+    sibling where it cuts loading from 431 s to 94 s. On this checkpoint it
+    exhausts all 121 GiB and takes the node down, even with the serial queue
+    (VLLM_FASTSAFETENSORS_QUEUE_SIZE=-1) that makes RC1 safe. Measured: RC1
+    loads all 15 shards (~72 GB) with memory plateauing near 40 GiB free, while
+    RC3 collapses at shard 13 of 19, having loaded only ~49 GB. So RC3 needs
+    materially more transient memory per shard — plausibly its repack, which
+    carries 385 explicit quantization ignores and a different fused-MoE layout
+    than the regex-based main line. That is a hypothesis, not a measurement.
+
+    The failure presents as a CPU hang (cores pegged, machine unresponsive) but
+    is really memory exhaustion; load average stayed near 2.7 throughout, and
+    the pegged cores are the kernel in page reclaim afterwards. GDS is also
+    unsupported here — "GDS is not supported in this platform but nogds is
+    False" — and vLLM cannot act on that, deriving nogds from tensor-parallel
+    size alone (nogds = pg.size() > 1), so at --tp 1 it is always False with no
+    override. Retest fastsafetensors only with a memory guard on the launch.
+
     gpu_memory_utilization 0.85 with max_num_batched_tokens 2048 is set by
     measurement, not preference. The sibling RC1 recipe at 0.92 with 16384 took
     the whole machine down: the kernel logged repeated "NVRM: Out of memory
