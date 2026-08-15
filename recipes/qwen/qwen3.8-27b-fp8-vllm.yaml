@@ -1,0 +1,52 @@
+description: Qwen's own FP8 checkpoint of Qwen3.8-27B on a single DGX Spark — the max-throughput multimodal profile (vision tower kept) with FP8 KV, the checkpoint's built-in MTP head at k=3, YaRN extension to a 1M context, and async scheduling. The quantization is 128x128 block-wise FP8-E4M3 weights with dynamic per-token activations, applied to the language model only; the vision tower stays unquantized and the MTP head ships quantized alongside it. That is ~31 GB of weights, roughly 7.5 GB more than the Unsloth NVFP4 build, in exchange for staying on the official numerics. --quantization is deliberately omitted so vLLM autodetects it (logs confirm quantization=fp8) — the ModelOpt path used by the Qwen3.6 NVFP4 recipes does not apply here. Qwen3.8 inherits the Qwen3.5 hybrid layout, so only 16 of the 64 layers carry full attention (4 KV heads at head_dim 256), which makes KV unusually cheap for the context length — measured ~34 KiB/token at fp8, plus DeltaNet recurrent state per sequence that is constant regardless of length. That is what makes 1M affordable on one node. DGX Spark unified memory is 127.6 GB and vLLM's gpu_memory_utilization claims host RAM rather than a separate VRAM pool, so this sits at 0.65 — higher than the NVFP4 sibling's 0.6 purely to cover the extra ~7.5 GB of weights, and it lands at 39.97 GiB of KV, 1,203,125 tokens, 1.20x concurrency at the full 1M. Below about 0.61 a 1M sequence will not fit at all and vLLM refuses to start; drop to 0.5 with max_model_len 262144 if you would rather keep the host roomier and take more concurrency at the native context. The 1M context needs both the YaRN rope_overrides and VLLM_ALLOW_LONG_MAX_MODEL_LEN=1, and it is verified working here — a 286,985-token needle-in-haystack retrieved correctly, well past the 262144 native limit. Be aware the trade-off is real and always on — vLLM implements static YaRN, so the factor 4.0 scaling applies to short prompts too, and Qwen advises against it unless you actually need long context. Lower factor to 2.0 for a 512k ceiling, or delete rope_overrides and VLLM_ALLOW_LONG_MAX_MODEL_LEN and set max_model_len 262144 to run unscaled. mm_processor_kwargs is not cosmetic — the vision tower has only 2304 position embeddings, and any image that resizes past that (anything much over ~1500x1500) fails the request with a 400 from Qwen3VLProcessor. The 2 Mpx budget makes the processor downscale instead, capping images at ~2016 vision tokens — a 4000x3000 photo goes through fine. Tool calls use the qwen3_xml parser to match repo convention and are verified emitting parsed tool_calls; vLLM's qwen3_coder parser reads the same <tool_call>/<function=> template if you prefer it. MTP measured 73-78% draft acceptance at mean acceptance length 3.2-3.3, a little below the NVFP4 build's 86%. Tested on vLLM 0.27.2rc1 in eugr/spark-vllm:latest.
+model: Qwen/Qwen3.8-27B-FP8
+container: eugr/spark-vllm:latest
+mods: []
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.65
+  max_model_len: 1000000
+  max_num_batched_tokens: 32768
+  max_num_seqs: 16
+  limit_mm_per_prompt: '{"image": 1, "video": 0}'
+  mm_processor_kwargs: '{"size": {"longest_edge": 2097152, "shortest_edge": 65536}}'
+  rope_overrides: '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}'
+  served_model_name: qwen3.8-27b
+  speculative_config: '{"method":"mtp","num_speculative_tokens":3}'
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1'
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+command: |
+  vllm serve Qwen/Qwen3.8-27B-FP8 \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --load-format fastsafetensors \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --limit-mm-per-prompt '{limit_mm_per_prompt}' \
+    --mm-processor-kwargs '{mm_processor_kwargs}' \
+    --hf-overrides '{rope_overrides}' \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --speculative-config '{speculative_config}'
+recipe_version: "2"
+name: Qwen3.8-27B-FP8-Qwen-DGX-Spark
+cluster_only: false
+solo_only: false
