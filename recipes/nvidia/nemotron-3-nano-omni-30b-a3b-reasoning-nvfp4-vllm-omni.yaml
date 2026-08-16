@@ -6,7 +6,39 @@ max_nodes: 1
 container: vllm/vllm-omni:latest-aarch64
 
 metadata:
-  description: NVIDIA Nemotron 3 Nano Omni NVFP4 serving with vLLM-Omni
+  description: >-
+    NVIDIA Nemotron 3 Nano Omni NVFP4 serving with vLLM-Omni.
+
+    Weight loading uses --load-format fastsafetensors rather than the
+    instanttensor loader the poolside and Qwen3.8 recipes moved to. That is a
+    container constraint, not a preference: vllm/vllm-omni:latest-aarch64 has no
+    instanttensor package (verified — `import instanttensor` raises
+    ModuleNotFoundError), and while the sdist does build cleanly on aarch64
+    against this image's Python 3.12 and gcc, PyPI publishes x86_64 wheels only,
+    so every container start would pay a from-source compile that costs more
+    than the loading it saves. fastsafetensors 0.3.3 is already installed here,
+    so it is free to switch on. The image's vLLM is 0.26.0, older than the
+    0.27.2rc1 the other recipes run.
+
+    VLLM_FASTSAFETENSORS_QUEUE_SIZE=-1 is set for the same reason as the
+    poolside RC1 recipe: vLLM defaults the queue to 0, which the fastsafetensors
+    ParallelLoader treats as an unbuffered pipeline holding two batches of file
+    buffers at once, and on a Spark's shared 121 GiB that second batch is what
+    exhausts memory and wedges the node. -1 selects the serial path. This
+    checkpoint is only ~21 GB so it has far more headroom than the ~72 GB
+    poolside ones, but the serial queue costs nothing here. FASTSAFETENSORS_UNIFIED_MEM=0
+    matches the combination measured on the poolside recipes, where the
+    unified-memory copier consumed memory faster than it saved time. GDS is
+    unsupported on this platform and vLLM derives nogds from tensor-parallel
+    size alone, so the "GDS is not supported" warning is expected and harmless
+    at --tp 1. Drop the flag to fall back to the default mmap loader.
+
+    Not yet launched with this loader — the flag and env are carried over from
+    the measured poolside configuration, and the package check above was run
+    against the image, but no load has been timed on this checkpoint. Note the
+    command installs vllm[audio] at container start, which can move vLLM off the
+    0.26.0 the image ships; the package checks above describe the image as
+    pulled, not necessarily the resolved runtime after that install.
   model_params: 31B
   model_dtype: nvfp4
   model_vram: 21
@@ -22,6 +54,12 @@ defaults:
   max_num_batched_tokens: 32768
   max_num_seqs: 8
   served_model_name: nemotron-3-nano-omni-nvfp4
+
+# Load-time memory safety for --load-format fastsafetensors; without the serial
+# queue the loader can exhaust the node's shared memory. See the description.
+env:
+  VLLM_FASTSAFETENSORS_QUEUE_SIZE: "-1"
+  FASTSAFETENSORS_UNIFIED_MEM: "0"
 
 command: |
   model_snapshot="$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download(\"nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4\", local_files_only=True))")" && \
@@ -44,6 +82,7 @@ command: |
     --max-num-batched-tokens {max_num_batched_tokens} \
     --kv-cache-dtype fp8 \
     --trust-remote-code \
+    --load-format fastsafetensors \
     --video-pruning-rate 0.5 \
     --limit-mm-per-prompt '{"video": 1, "image": 1, "audio": 1}' \
     --media-io-kwargs '{"video": {"fps": 2, "num_frames": 256}}' \

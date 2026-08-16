@@ -35,6 +35,26 @@ metadata:
     single 1M-token request would not fit. 262144 leaves headroom and matches
     the sibling recipe.
 
+    Weight loading uses --load-format instanttensor, and on this checkpoint that
+    is the interesting result: it succeeds where both fastsafetensors variants
+    took the node down. Measured 2026-08-16 on vLLM 0.27.2rc1.dev113 — weights
+    in 24.09 s, drafter 1.35 s, model loading 69.73 GiB in 30.50 s, against
+    ~429 s for the mmap loader this replaces. It walked straight through the
+    ~48 GB point where fastsafetensors collapsed at shard 13 of 19, with memory
+    bottoming out around 7-9 GiB available (some of that pressure was an
+    unrelated download running concurrently) and never approaching exhaustion.
+    The server came up and served both a correct generation and a parsed tool
+    call; KV cache 808,748 tokens, 3.09x at 262144.
+
+    That is worth stating plainly against the paragraph below: the hypothesis
+    that RC3's repack structurally needs more transient memory per shard does
+    not generalize to this loader. Whatever fastsafetensors was doing on the
+    385-ignore repack, instanttensor does not do. If it ever does regress, drop
+    the flag and go back to --safetensors-load-strategy lazy, which is slow but
+    has never wedged the node. The loader needs the instanttensor package in the
+    image, which eugr/spark-vllm:latest ships; PyPI has x86_64 wheels only, so
+    an image without it cannot pick this up cheaply.
+
     --load-format fastsafetensors is deliberately NOT used here, unlike the RC1
     sibling where it cuts loading from 431 s to 94 s. On this checkpoint it
     exhausts all 121 GiB and takes the node down, even with the serial queue
@@ -153,7 +173,7 @@ command: |
     --tokenizer-revision {revision} \
     --trust-remote-code \
     --dtype auto \
-    --safetensors-load-strategy lazy \
+    --load-format instanttensor \
     --tensor-parallel-size {tensor_parallel} \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --max-model-len {max_model_len} \

@@ -1,8 +1,18 @@
 recipe_version: "1"
 name: Qwen36-35B-A3B-NVFP4-nvidia
-description: vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4
+description: >-
+  vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4. Runs on eugr/spark-vllm:latest
+  rather than the locally-built vllm-node image, which matches the rest of the
+  registry and is what makes --load-format instanttensor available — that loader
+  needs the instanttensor package in the image and hard-fails without it. On the
+  poolside checkpoints instanttensor measured 3.2-3.5x faster than
+  fastsafetensors and ~12x faster than the mmap loader; it has not been timed on
+  this checkpoint. The image swap is not purely cosmetic: this recipe pins
+  --moe-backend marlin, --attention-backend flashinfer and
+  VLLM_MARLIN_USE_ATOMIC_ADD, which were chosen against the old image, so
+  confirm they still behave on the first launch here.
 model: nvidia/Qwen3.6-35B-A3B-NVFP4
-container: vllm-node
+container: eugr/spark-vllm:latest
 cluster_only: false
 
 defaults:
@@ -34,7 +44,7 @@ command: |
     --async-scheduling \
     --enable-prefix-caching \
     --speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}' \
-    --load-format fastsafetensors \
+    --load-format instanttensor \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_xml \
     --enable-auto-tool-choice

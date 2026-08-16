@@ -65,23 +65,49 @@ metadata:
     itself prove the drafter pairing is what fixed it. Acceptance is still
     0.306 at position 6, so 7 may not be the ceiling.
 
-    --load-format fastsafetensors cuts weight loading from 431 s to 94 s
-    (measured, ~4.6x), but it needs VLLM_FASTSAFETENSORS_QUEUE_SIZE=-1 or it
-    takes the whole node down. The failure looks like a CPU hang — cores pegged,
+    Weight loading uses --load-format instanttensor. It needs the instanttensor
+    package present in the image, which is what keeps the rest of the registry
+    on fastsafetensors — but this recipe already pins eugr/spark-vllm:latest,
+    which ships it (0.1.9, built there as a cp312 linux_aarch64 wheel; PyPI
+    publishes x86_64 wheels only), so that caveat does not apply here.
+
+    Measured 2026-08-16 on vLLM 0.27.2rc1.dev113: weights in 27.17 s and 29.71 s
+    across two runs, drafter ~1.5 s, model loading 69.26 GiB in 33.67 s / 36.02 s
+    total. That is against 94 s for fastsafetensors and 431 s for the mmap
+    loader on the identical 69.26 GiB footprint — 3.2-3.5x over fastsafetensors
+    and ~12x over mmap. Memory during loading fell to 34-37 GiB available and
+    plateaued, with no sign of the runaway the fastsafetensors path can trigger.
+    Both runs served a correct generation and a parsed tool call. KV cache came
+    out at 782,846 and 805,935 tokens (2.99x / 3.07x at 262144), a little under
+    the 824,466 / 3.15x recorded earlier on an older build.
+
+    One number worth carrying: after the KV cache is allocated this config sits
+    at ~11 GiB available, not the ~18 GiB estimated further down. That is the
+    normal steady state, not a warning sign — a memory guard armed above it will
+    kill a healthy server during FlashInfer autotuning.
+
+    Fallbacks, in order. --load-format fastsafetensors cut weight loading from
+    431 s to 94 s here (measured, ~4.6x) and is safe on this checkpoint, but
+    only with VLLM_FASTSAFETENSORS_QUEUE_SIZE=-1 — without it the loader takes
+    the whole node down. The failure looks like a CPU hang — cores pegged,
     machine unresponsive — but that is the aftermath. What actually happens is
     memory exhaustion: available RAM goes from 40 GiB to 0 in about 45 seconds
     partway through loading, and the kernel then burns every core in page
     reclaim. Load average during the collapse measured 2.6, which is what rules
-    out a genuine CPU-bound cause.
+    out a genuine CPU-bound cause. Below that, --load-format auto is the slow
+    (431 s) but safe last resort.
 
-    The mechanism is queue depth. vLLM defaults the queue to 0, which the
-    fastsafetensors ParallelLoader reads as "unbuffered pipeline" — one batch
-    copying while another broadcasts, i.e. two batches of file buffers resident
-    at once. On a Spark, where host and GPU share 121 GiB, the second batch is
-    what does not fit. -1 selects the fully serial path (one batch in memory);
-    memory then plateaus around 40 GiB free through loading. Note this is
-    orthogonal to gpu_memory_utilization: the collapse happens during loading,
-    before the KV cache is sized, and dropping gmu to 0.75 did not prevent it.
+    The mechanism behind that collapse is queue depth. vLLM defaults the queue
+    to 0, which the fastsafetensors ParallelLoader reads as "unbuffered
+    pipeline" — one batch copying while another broadcasts, i.e. two batches of
+    file buffers resident at once. On a Spark, where host and GPU share 121 GiB,
+    the second batch is what does not fit. -1 selects the fully serial path (one
+    batch in memory); memory then plateaus around 40 GiB free through loading.
+    Note this is orthogonal to gpu_memory_utilization: the collapse happens
+    during loading, before the KV cache is sized, and dropping gmu to 0.75 did
+    not prevent it. This is why VLLM_FASTSAFETENSORS_QUEUE_SIZE and
+    FASTSAFETENSORS_UNIFIED_MEM stay in env: they are inert under instanttensor
+    but load-bearing the moment anyone flips back.
 
     GDS itself is unsupported here — the log carries "GDS is not supported in
     this platform but nogds is False. use nogds=True" — and vLLM cannot act on
@@ -92,12 +118,11 @@ metadata:
     copier (UNIFIED_MEM=1, auto-enabled on a "gb10" device name) was tried on
     the RC3 sibling and made things worse there — faster per shard, so it
     exhausted memory sooner — which is why 0 is kept here rather than trusting
-    the auto-detection. If loading ever wedges the box again, --load-format auto is the safe
-    fallback.
+    the auto-detection.
 
-    This is checkpoint-specific, not a general Spark fix: the RC3 sibling still
-    exhausts all 121 GiB with the identical loader settings, collapsing at shard
-    13 of 19, so it stays on the mmap loader. Do not copy these env vars to
+    The fastsafetensors result is checkpoint-specific, not a general Spark fix:
+    the RC3 sibling still exhausts all 121 GiB with the identical loader
+    settings, collapsing at shard 13 of 19. Do not copy these env vars to
     another checkpoint without a memory guard on the first launch.
 
     gpu_memory_utilization 0.85 with max_num_batched_tokens 2048 is set by
@@ -153,8 +178,9 @@ env:
   # From the working DGX Spark config in HF discussion #25, on this same
   # eugr/spark-vllm build.
   VLLM_USE_FLASHINFER_SAMPLER: "1"
-  # Load-time memory safety for --load-format fastsafetensors; without these the
-  # loader exhausts all 121 GiB and wedges the node. See the description.
+  # Load-time memory safety for the --load-format fastsafetensors fallback;
+  # inert under the instanttensor loader this recipe now uses, but without these
+  # fastsafetensors exhausts all 121 GiB and wedges the node. See the description.
   VLLM_FASTSAFETENSORS_QUEUE_SIZE: "-1"
   FASTSAFETENSORS_UNIFIED_MEM: "0"
 
@@ -165,7 +191,7 @@ command: |
     --tokenizer-revision {revision} \
     --trust-remote-code \
     --dtype auto \
-    --load-format fastsafetensors \
+    --load-format instanttensor \
     --tensor-parallel-size {tensor_parallel} \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --max-model-len {max_model_len} \
