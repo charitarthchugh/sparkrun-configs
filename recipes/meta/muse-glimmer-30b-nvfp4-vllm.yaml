@@ -1,0 +1,157 @@
+recipe_version: "2"
+model: RedHatAI/Muse-Glimmer-30B-NVFP4
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: eugr/spark-vllm:latest
+
+metadata:
+  description: >-
+    Meta's Muse-Glimmer-30B on a single DGX Spark, using RedHat's NVFP4
+    requantization of meta-models/Muse-Glimmer-30B. Multimodal (vision tower
+    kept) with FP8 KV, serving the full native 131072-token context.
+
+    The checkpoint is compressed-tensors nvfp4-pack-quantized produced by
+    llm-compressor, NOT a ModelOpt one, so --quantization is deliberately
+    omitted and vLLM autodetects it. This follows the Qwen3.8 recipes rather
+    than the Qwen3.6 ones; passing "modelopt" here would misread the weights.
+    The quantization_config carries 305 explicit ignore entries, and the vision
+    tower stays unquantized. Weights are 23.38 GB across 2 shards.
+
+    Neither of the checkpoints originally asked for exists. unsloth publishes
+    only GGUF, bf16 and bnb-4bit for this model, with no NVFP4, and meta-models
+    publishes no FP8 at all, so there is no official FP8 to track. RedHat also
+    ships an FP8-block and a W4A16 build if a different tradeoff is wanted.
+
+    Architecture is MuseGlimmerForConditionalGeneration, supported natively by
+    vLLM in eugr/spark-vllm:latest along with dedicated muse_glimmer reasoning
+    and tool-call parsers, which is what --reasoning-parser and
+    --tool-call-parser are set to. The chat template is Harmony-style, built on
+    start/message/eot/eom sentinels rather than the XML-ish tags the Qwen
+    recipes parse, so the qwen3 parsers do not apply here.
+
+    KV is very cheap on this model, and more so than the config alone suggests.
+    Meta's card documents the attention pattern as [Local, Local, Local, Global]
+    repeating with a 2048 sliding window, and RoPE (theta 500,000) applied to the
+    local layers only. So of the 52 layers just 13 are global and grow KV with
+    context; the other 39 are capped at the 2048 window. With 2 KV heads at
+    head_dim 128, a naive all-layers-global estimate gives ~26 KiB/token at fp8,
+    and the real figure is far below that, so KV is not what sets the budget
+    here. gpu_memory_utilization is 0.7, set by measurement after 0.8 was tried
+    and rejected. At 0.8 this box does not merely run thin, it runs out — memory
+    fell from 10 GiB to 4 GiB available in about 70 seconds during KV
+    allocation, still dropping, and a guard killed the launch before it reached
+    the point where the kernel would have. The lesson is the usual DGX Spark one
+    in a sharper form: gpu_memory_utilization claims host RAM here, and 0.8 of
+    127.6 GB does not leave what the arithmetic suggests once the perception
+    encoder, the multimodal activation buffers and cudagraph capture are added
+    on top of the KV pool. 0.7 is the retreat from that, and it is still well
+    above the 0.5 the Qwen3.6-27B recipes use — with only ~23 GB of weights the
+    KV pool at 0.7 is large. Do not raise this without a memory guard armed on
+    the launch. sparkrun's own VRAM estimate of 1,472,039
+    max context tokens treats every layer as global, so treat it as a floor on
+    capacity, not a ceiling.
+
+    Sampling defaults follow the card's recommendation — temperature 1.0,
+    top_p 0.95, top_k 64 — passed via --override-generation-config. The override
+    is load-bearing rather than decorative — this checkpoint's
+    generation_config.json ships do_sample false and carries no temperature,
+    top_p or top_k at all, so without it the server would decode greedily,
+    against the card's own guidance. Note the top_k of 64 is specific to this
+    model; the ThinkingCap recipe uses 20 because its card says so, and the two
+    should not be reconciled. The card also documents a
+    "Reasoning strength" control set through the system prompt, taking low,
+    medium, high or xhigh, with high or xhigh recommended for coding and agentic
+    work. That is a per-request system-prompt line rather than a server flag, so
+    this recipe does not pin it; set it in the client.
+
+    The perception encoder is a ~1.8B ViT-G/14 (50 layers, width 1536, patch 14),
+    and the card caps a single image at 4096 visual tokens, which is what
+    limit_mm_per_prompt is sized against.
+
+    Weight loading uses --load-format instanttensor, which needs the
+    instanttensor package in the image; eugr/spark-vllm:latest ships it, and
+    PyPI has x86_64 wheels only, so an image without it cannot pick this up
+    cheaply — fall back to fastsafetensors there.
+
+    Speculative decoding is not enabled here, which leaves performance on the
+    table. Meta ships DFlash as a first-class part of this release — a 5-layer
+    block-diffusion drafter predicting 16 tokens per forward pass — and reports
+    3.1x on an RTX 5090 (74.9 to 233.4 tok/s), 1.5-1.8x on M4/M5 Max, with
+    output quality unchanged. vLLM registers both MuseGlimmerAssistantModel and
+    DFlashMuseGlimmerAssistantModel, and meta-models/Muse-Glimmer-30B-assistant
+    is the drafter repo. Wiring it up follows the poolside recipes'
+    --speculative-config pattern. It is left off only because the pairing has not
+    been tested here, not because it is a bad idea; enabling it is the first
+    thing to try after a baseline run.
+
+    Measured 2026-08-16 on vLLM 0.27.2rc1.dev113, at gpu_memory_utilization 0.7.
+    instanttensor read all 21.8 GB at 9.98 GB/s — weights in 3.63 s, model
+    loading 21.81 GiB in 9.98 s. KV cache 54.49 GiB giving 3,451,206 tokens and
+    26.33x concurrency at 131072, so the sliding-window layers do pay off, but
+    at ~16.6 KiB/token rather than the naive ~26 KiB/token above. Available
+    memory bottomed out at 16 GiB, comfortably clear of the floor. The server
+    served a correct generation and a parsed tool call.
+
+    Two things are worth knowing before the first launch. vLLM picks
+    FlashInferCutlassNvFp4LinearKernel here, meaning real NVFP4 GEMMs rather
+    than the Marlin weight-only fallback the ThinkingCap NVFP4 recipe gets — the
+    two checkpoints look similar on paper and do not take the same kernel path.
+    And startup is slow the first time in a way the loader has nothing to do
+    with: init engine took 586 s, of which the weights were 10 s and
+    torch.compile 46 s. The rest is FlashInfer's fp4_gemm autotuner, which ran
+    five sweeps of 23 profiles, the worst taking 4 min 38 s on its own. That is
+    a cold-cache cost, so budget ten minutes for a first run on a new image and
+    expect later starts to be far quicker.
+
+    Reasoning output did not appear as reasoning_content on a plain coding
+    prompt — the field came back null while content was correct and complete.
+    That looks like the model not opening an analysis channel for a simple
+    request rather than a parser fault, since the muse_glimmer tool parser
+    worked on the same server, but it has not been checked against a prompt that
+    forces reasoning.
+  quantization: nvfp4
+  model_params: 30B
+  model_dtype: nvfp4
+  model_vram: 24
+  kv_dtype: fp8
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 131072
+  max_num_batched_tokens: 32768
+  max_num_seqs: 8
+  served_model_name: muse-glimmer-30b-nvfp4
+  # Meta's recommended sampling settings from the upstream model card.
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+
+env:
+  CUTE_DSL_ARCH: sm_121a
+  MAX_JOBS: "4"
+
+command: |
+  vllm serve {model} \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --load-format instanttensor \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-chunked-prefill \
+    --enable-prefix-caching \
+    --async-scheduling \
+    --limit-mm-per-prompt '{"image": 1, "video": 0}' \
+    --override-generation-config '{"temperature": {temperature}, "top_p": {top_p}, "top_k": {top_k}}' \
+    --reasoning-parser muse_glimmer \
+    --tool-call-parser muse_glimmer \
+    --enable-auto-tool-choice
