@@ -33,12 +33,17 @@ metadata:
     size alone, so the "GDS is not supported" warning is expected and harmless
     at --tp 1. Drop the flag to fall back to the default mmap loader.
 
-    Not yet launched with this loader — the flag and env are carried over from
-    the measured poolside configuration, and the package check above was run
-    against the image, but no load has been timed on this checkpoint. Note the
-    command installs vllm[audio] at container start, which can move vLLM off the
-    0.26.0 the image ships; the package checks above describe the image as
-    pulled, not necessarily the resolved runtime after that install.
+    Measured 2026-08-16 on this checkpoint: weights in 23.91 s, model loading
+    21.43 GiB in 25.87 s, across 3 shards. Available memory bottomed out at
+    78 GiB with no sign of the runaway the serial queue guards against — this
+    checkpoint has far more headroom than the ~72 GB poolside ones. KV cache
+    20,404,165 tokens. Came up clean and served both a correct generation and a
+    parsed tool call. The expected "GDS is not supported in this platform but
+    nogds is False" warning appears and is harmless, as described above.
+
+    The command installs vllm[audio] at container start, and that step reports
+    fastsafetensors>=0.3.2 already satisfied at 0.3.3, so the loader survives the
+    install rather than depending on it. vLLM resolved to 0.26.0 on this run.
   model_params: 31B
   model_dtype: nvfp4
   model_vram: 21

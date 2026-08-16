@@ -1,16 +1,35 @@
 recipe_version: "1"
 name: Qwen36-35B-A3B-NVFP4-nvidia
 description: >-
-  vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4. Runs on eugr/spark-vllm:latest
-  rather than the locally-built vllm-node image, which matches the rest of the
-  registry and is what makes --load-format instanttensor available — that loader
-  needs the instanttensor package in the image and hard-fails without it. On the
-  poolside checkpoints instanttensor measured 3.2-3.5x faster than
-  fastsafetensors and ~12x faster than the mmap loader; it has not been timed on
-  this checkpoint. The image swap is not purely cosmetic: this recipe pins
-  --moe-backend marlin, --attention-backend flashinfer and
-  VLLM_MARLIN_USE_ATOMIC_ADD, which were chosen against the old image, so
-  confirm they still behave on the first launch here.
+  vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4 with --load-format instanttensor.
+  container is set to eugr/spark-vllm:latest rather than the locally-built
+  vllm-node image, to match the rest of the registry.
+
+  Be aware that the container line is not what actually runs here. Measured
+  2026-08-16: sparkrun launched this recipe on
+  ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest despite both the recipe and
+  `sparkrun run --dry-run` reporting eugr/spark-vllm:latest — different image
+  IDs, confirmed against the container named for this job. The nemotron-omni
+  recipe launches on exactly the image it names, so the substitution is specific
+  to this recipe, which is also the only one where sparkrun runs a Building step
+  instead of skipping it. No image mapping was found in ~/.config/sparkrun/. The
+  test below therefore describes the nightly image; it happens to ship
+  instanttensor too, which is why the loader worked at all.
+
+  Measured on that image, vLLM 0.27.2rc1.dev113: weights in 24.99 s, MTP head in
+  9.34 s, model loading 21.96 GiB in 43.05 s. KV cache 3,928,360 tokens, 14.99x
+  concurrency at 262144. Served a correct generation and a parsed tool call, and
+  MTP held up — mean acceptance length 3.32, 77.4% average draft acceptance,
+  per-position 0.910/0.759/0.654. The --moe-backend marlin,
+  --attention-backend flashinfer and VLLM_MARLIN_USE_ATOMIC_ADD settings were
+  chosen against the old image and all survived the move.
+
+  One surprise worth recording: the engine resolves quantization=modelopt_mixed
+  and logs "Your GPU does not have native support for FP4 computation", falling
+  back to Marlin weight-only FP4 compression, which it warns may degrade
+  compute-heavy workloads. That is unexpected on GB10 and differs from how the
+  other NVFP4 recipes resolve. It is observed behavior on this image, not
+  something this recipe sets.
 model: nvidia/Qwen3.6-35B-A3B-NVFP4
 container: eugr/spark-vllm:latest
 cluster_only: false

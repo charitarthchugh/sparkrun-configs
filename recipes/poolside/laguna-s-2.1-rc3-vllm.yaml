@@ -118,10 +118,13 @@ metadata:
     large refactor (~40% of requirements ignored) despite being faster. RC3 is
     the speed/memory pick, not established as the quality pick.
 
-    Untested risk: RC3's tokenizer_config.json is the transformers 5.12 format
-    ("tokenizer_class": "TokenizersBackend", 428 bytes vs main's 13 KB). If the
-    container's transformers is older than 5.12 this recipe will fail at
-    tokenizer load, and that is the first thing to check on a startup failure.
+    RC3's tokenizer_config.json is the transformers 5.12 format
+    ("tokenizer_class": "TokenizersBackend", 428 bytes vs main's 13 KB), which
+    was previously flagged as an untested risk on the theory that an older
+    transformers in the container would fail at tokenizer load. That is resolved
+    — the 2026-08-16 run on eugr/spark-vllm:latest loaded the tokenizer without
+    complaint and served normally. It remains the first thing to check on a
+    startup failure in an older image.
   quantization: nvfp4
   model_params: 117.6B
   model_dtype: nvfp4
