@@ -138,8 +138,9 @@ metadata:
     the steady-state start is under two minutes. Budget two slow starts, not
     one, after the cache is cleared or the eugr/spark-vllm:latest tag drifts.
     The tree lands around 79 MB, 55 MB of vLLM torch_compile_cache, 22 MB of
-    Triton, 2.3 MB of FlashInfer JIT objects. Every launch served a chat
-    completion.
+    Triton, 2.3 MB of FlashInfer JIT objects. The first two launches each
+    served a chat completion; the third was verified only as far as
+    Application startup complete.
   quantization: nvfp4
   model_params: 30B
   model_dtype: nvfp4

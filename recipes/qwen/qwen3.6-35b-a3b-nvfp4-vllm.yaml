@@ -49,7 +49,9 @@ description: >-
   config". That is unlike the Laguna recipes, whose hash changes every launch,
   and unlike Muse-Glimmer, which needs three launches before it settles. The
   tree lands around 116 MB, 68 MB of Triton, 47 MB of vLLM torch_compile_cache,
-  1.7 MB of FlashInfer JIT objects, and every launch served a chat completion.
+  1.7 MB of FlashInfer JIT objects. The first two launches each served a chat
+  completion; the third was verified only as far as Application startup
+  complete.
 model: nvidia/Qwen3.6-35B-A3B-NVFP4
 container: eugr/spark-vllm:latest
 cluster_only: false
