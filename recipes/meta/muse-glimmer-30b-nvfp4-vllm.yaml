@@ -110,6 +110,36 @@ metadata:
     request rather than a parser fault, since the muse_glimmer tool parser
     worked on the same server, but it has not been checked against a prompt that
     forces reasoning.
+
+    Startup caching relies on sparkrun 0.3.5, which mounts a per-model host
+    directory at /cache/runtime and points VLLM_CACHE_ROOT,
+    TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR and XDG_CACHE_HOME into it, so
+    this recipe sets none of those paths itself — a path in env wins over the
+    managed one and would escape the keyed, pruned tree. The single addition is
+    FLASHINFER_WORKSPACE_BASE, because FlashInfer 0.6.18 reads only that
+    variable and derives its own cache dir internally, leaving sparkrun's
+    FLASHINFER_CACHE_DIR export inert; without it the JIT-compiled kernels sit
+    in /tmp and die with the --rm container.
+
+    This model is the one where the caching story is not a simple cold-warm
+    pair, because startup here is dominated by FlashInfer autotuning 115
+    fp4_gemm configs rather than by torch.compile. Three consecutive launches on
+    2026-08-18, the first with the runtime-cache tree deleted: wall clock to
+    Application startup complete 636 s, then 564 s, then 116 s, with init engine
+    574.00 s (39.88 s compilation), 510.82 s (0.35 s) and 59.22 s (0.51 s). The
+    second launch is barely faster because it re-ran the full 7.7 minutes of
+    autotuning under a different config hash than the first
+    (25f8d51e... against daa90c71...), logging "115 new, 0 from previous
+    config" both times. The third launch matched the second's hash and logged
+    "Loaded 115 configs ... (0 new, 115 from previous config)", finishing the
+    autotune step in 1.3 s. So the pattern is that the compiling launch and the
+    artifact-loading launch hash differently, and the cache only starts paying
+    from the third launch onward — but from there it is a 5.5x improvement and
+    the steady-state start is under two minutes. Budget two slow starts, not
+    one, after the cache is cleared or the eugr/spark-vllm:latest tag drifts.
+    The tree lands around 79 MB, 55 MB of vLLM torch_compile_cache, 22 MB of
+    Triton, 2.3 MB of FlashInfer JIT objects. Every launch served a chat
+    completion.
   quantization: nvfp4
   model_params: 30B
   model_dtype: nvfp4
@@ -133,6 +163,10 @@ defaults:
 env:
   CUTE_DSL_ARCH: sm_121a
   MAX_JOBS: "4"
+  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
+  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
+  # compiled kernels land in /tmp and die with the --rm container.
+  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
 
 command: |
   vllm serve {model} \
