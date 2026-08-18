@@ -30,6 +30,26 @@ description: >-
   compute-heavy workloads. That is unexpected on GB10 and differs from how the
   other NVFP4 recipes resolve. It is observed behavior on this image, not
   something this recipe sets.
+
+  Startup caching relies on sparkrun 0.3.5, which mounts a per-model host
+  directory at /cache/runtime and points VLLM_CACHE_ROOT,
+  TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR and XDG_CACHE_HOME into it, so this
+  recipe sets none of those paths itself — a path in env wins over the managed
+  one and would escape the keyed, pruned tree. The single addition is
+  FLASHINFER_WORKSPACE_BASE, because FlashInfer 0.6.18 reads only that variable
+  and derives its own cache dir internally, leaving sparkrun's
+  FLASHINFER_CACHE_DIR export inert; without it the JIT-compiled kernels sit in
+  /tmp and die with the --rm container. This recipe is the cleanest case of the
+  four measured on 2026-08-18. Three consecutive launches, the first with the
+  runtime-cache tree deleted, gave wall clock to Application startup complete of
+  279 s, 156 s and 157 s, with init engine 134.92 s (44.84 s compilation), then
+  41.57 s (16.95 s) and 43.21 s (16.96 s). The FlashInfer autotune config hash
+  was identical on all three (25cdbfa6...), so its 69 fp8_gemm configs are
+  reused from the second launch on — the third logged "0 new, 69 from previous
+  config". That is unlike the Laguna recipes, whose hash changes every launch,
+  and unlike Muse-Glimmer, which needs three launches before it settles. The
+  tree lands around 116 MB, 68 MB of Triton, 47 MB of vLLM torch_compile_cache,
+  1.7 MB of FlashInfer JIT objects, and every launch served a chat completion.
 model: nvidia/Qwen3.6-35B-A3B-NVFP4
 container: eugr/spark-vllm:latest
 cluster_only: false
@@ -45,6 +65,10 @@ defaults:
 
 env:
   VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
+  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
+  # compiled kernels land in /tmp and die with the --rm container.
+  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
 
 command: |
   vllm serve nvidia/Qwen3.6-35B-A3B-NVFP4 \
