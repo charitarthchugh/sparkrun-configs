@@ -137,6 +137,27 @@ metadata:
     it. 0.85 leaves ~18 GiB, and the KV cache still holds roughly 700K tokens,
     comfortably above the 262144 context. Raise it only with a way to recover
     the box.
+
+    Startup caching relies on sparkrun 0.3.5, which mounts a per-model host
+    directory at /cache/runtime and points VLLM_CACHE_ROOT,
+    TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR and XDG_CACHE_HOME into it, so
+    this recipe sets none of those paths itself — a path in env wins over the
+    managed one and would escape the keyed, pruned tree. The single addition is
+    FLASHINFER_WORKSPACE_BASE, because FlashInfer 0.6.18 reads only that
+    variable and derives its own cache dir internally, leaving sparkrun's
+    FLASHINFER_CACHE_DIR export inert; without it the JIT-compiled kernels sit
+    in /tmp and die with the --rm container. The cache key includes the
+    revision, so RC1 and RC3 get separate trees despite naming the same repo
+    (poolside__Laguna-S-2.1-NVFP4-122156f6 against ...-33693586) and neither
+    warms the other. Measured cold against warm on 2026-08-18, cold meaning the
+    runtime-cache tree was deleted first, wall clock from launch to Application
+    startup complete went from 217 s to 146 s and init engine from 122.09 s
+    with 47.06 s of compilation to 63.34 s with 5.98 s. Both runs served a chat
+    completion, and the tree lands around 131 MB. As on RC3, the FlashInfer MoE
+    autotune step is not reused — both launches logged "Saved 42 configs ...
+    (42 new, 0 from previous config)" under different config hashes — so that
+    work is paid every time and the gain above is torch.compile, Triton and
+    FlashInfer JIT only.
   quantization: nvfp4
   model_params: 117.6B
   model_dtype: nvfp4
@@ -178,6 +199,10 @@ env:
   # From the working DGX Spark config in HF discussion #25, on this same
   # eugr/spark-vllm build.
   VLLM_USE_FLASHINFER_SAMPLER: "1"
+  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
+  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
+  # compiled kernels land in /tmp and die with the --rm container.
+  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
   # Load-time memory safety for the --load-format fastsafetensors fallback;
   # inert under the instanttensor loader this recipe now uses, but without these
   # fastsafetensors exhausts all 121 GiB and wedges the node. See the description.
