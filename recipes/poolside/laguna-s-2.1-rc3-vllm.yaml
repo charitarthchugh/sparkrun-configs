@@ -144,7 +144,13 @@ metadata:
     not saved here — both runs logged "Saved 42 configs ... (42 new, 0 from
     previous config)" under different config hashes, so the ~25 s of MoE
     autotuning is paid every launch and the gain above is torch.compile, Triton
-    and FlashInfer JIT only.
+    and FlashInfer JIT only. A third launch confirmed that rather than
+    contradicting it — hash 21d0b07b, distinct from both earlier ones, 42 new
+    configs again, wall 135 s and init engine 57.59 s with 0.54 s of
+    compilation. So ~135 s is the steady state here, and the autotune step
+    never stabilizes. The Muse-Glimmer recipe behaves differently, its hash
+    settling from the second launch on, so this is a per-model observation
+    rather than a general rule.
   quantization: nvfp4
   model_params: 117.6B
   model_dtype: nvfp4
