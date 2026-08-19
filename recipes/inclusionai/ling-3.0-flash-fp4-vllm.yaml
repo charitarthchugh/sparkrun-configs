@@ -1,0 +1,154 @@
+description: >-
+  inclusionAI Ling-3.0-flash-fp4 on a single DGX Spark. 124B total / 5.5B active
+  (non-emb 5.1B), native hybrid-linear architecture — 35 Kimi Delta Attention
+  (KDA) layers alternating 5:1 with 7 Gated MLA layers, 512 routed experts with
+  8 activated plus 1 shared, 262144-token native context.
+
+  Runs on stock vLLM, not the vendor's SGLang fork. The model card's Quickstart
+  points at a custom SGLang branch (ling_v3_support_mxfp4) pinned to FlashInfer
+  0.6.16.post1, and the vLLM section points at their own fork
+  (inclusionAI/vllm-ling-v3, branch ling_3_0). Neither is needed here: upstream
+  vLLM gained BF16/MTP/parser support in #51045, fp8 in #51265, and the mixed
+  fp8 + MXFP4-routed-expert path this checkpoint actually uses in #52114, merged
+  2026-08-13. eugr/spark-vllm:latest as of 2026-08-18 is
+  0.27.2rc1.dev209+gf9f066d19 and carries all three — verified by reading
+  bailing_moe_v3.py inside the image, not by version number alone.
+
+  The quantization is unusual and worth spelling out, because the flags below
+  deliberately do not name it. config.json declares quant_method fp8 (blockwise
+  128x128, dynamic activations) for the dense and attention weights, and then a
+  separate routed_experts_quant_method mxfp4 (e2m1 weights, e8m0 scales, group
+  size 32) for the 512 routed experts. vLLM's bailing_moe_v3 loader reads that
+  second key, flips Fp8Config.store_dtype to "mxfp4" so RoutedExperts resolve to
+  Mxfp4MoEMethod, and remaps the expert weight names. Passing --quantization
+  would short-circuit that, so this recipe lets the engine resolve it from the
+  checkpoint. The mxfp4 MoE oracle does not fall back to Marlin the way the
+  Qwen3.6-35B-A3B NVFP4 recipe does — measured 2026-08-18 it logs
+  MoEPrepareAndFinalizeNoDPEPModular and DeepGemmFP4Experts, and no "your GPU
+  does not have native support for FP4 computation" warning appears at all. So
+  the routed experts run a real FP4 path here rather than weight-only
+  decompression.
+
+  --enable-prefix-caching plus --mamba-cache-mode align follows the upstream
+  vLLM reference command on the parent model card. On a hybrid model vLLM would
+  pick align automatically once prefix caching is on (it refuses "all" mode
+  because BailingMoeV3ForCausalLM does not declare
+  supports_mamba_prefix_caching), and align asserts chunked prefill, which is
+  why --enable-chunked-prefill is explicit here rather than left to the default.
+  MTP is set to 3 to match that same reference even though the checkpoint has
+  num_nextn_predict_layers 1; vLLM allows it because n_predict divides 3 and it
+  reuses the single MTP module three times. Acceptance rate at that depth is
+  measured below and is the weakest part of the profile.
+
+  Memory: weights are 65.6 GiB on disk against 127.6 GB of unified memory, so
+  the usual DGX Spark trade-off inverts. Unlike the 20-GiB NVFP4 recipes in this
+  registry, where KV cache dominates and gpu_memory_utilization has to stay low,
+  here the weights dominate and KV is almost free — only 7 of 42 layers keep a
+  KV cache at all, and those are MLA (kv_lora_rank 512 + 64 rope), so the full
+  262144 context costs about 2 GiB at bf16 and half that at fp8. The
+  other 35 KDA layers hold a constant-size recurrent state per sequence instead.
+  That is also why kv_cache_dtype is left at auto rather than the fp8 this
+  registry usually pins (the flag is simply absent, which is vLLM's auto): bf16 KV over 7 MLA layers is only ~2 GiB at the full
+  262144 context, so fp8 would save nothing worth the risk of fp8 KV meeting
+  whatever MLA backend auto-resolves on sm_121 on a first launch. The upstream
+  vLLM reference command does not set it either. It stays a knob in defaults.
+  0.80 leaves ~32 GB over the weights for KV, KDA state and activations while
+  keeping ~25 GB for the host. The vendor reference uses 0.85, but that is a
+  4-GPU box with discrete VRAM, where the host is not competing for the same
+  pool.
+
+  MEASURED 2026-08-18 on vLLM 0.27.2rc1.dev209+gf9f066d19, torch 2.13.0+cu130,
+  CUDA 13.0, cold caches, single launch. Weights loaded in 19.76 s at ~4 GB/s,
+  then the MTP draft re-reads the same 65.5 GB in 11.67 s at 7.27 GB/s off warm
+  page cache. init engine (profile, create kv cache, warmup) took 197.21 s of
+  which 84.83 s was compilation; FlashInfer autotune saved 0 configs, so this
+  checkpoint's path has nothing to sweep, unlike the ModelOpt NVFP4 recipes.
+  Available KV cache 25.03 GiB, GPU KV cache size 2,438,110 tokens, 9.30x
+  concurrency at the full 262144 — far more headroom than the pre-launch
+  estimate suggested, because sparkrun's estimator sizes all 42 layers as MLA
+  when only 7 of them are. The hybrid page alignment resolves itself: vLLM sets
+  the attention block size to 2048 tokens so the attention page is >= the mamba
+  page, then pads the mamba page by 5.11% to make them exactly equal. Served a
+  correct generation with reasoning split into its own field by the ling3 parser
+  (291 reasoning tokens on a 351-token completion) and a correctly parsed
+  get_weather tool call with finish_reason tool_calls.
+
+  MTP at k=3 is the weakest part of the profile and the number to revisit. Over
+  689 drafts / 2067 draft tokens: 1245 accepted, 60.2% average draft acceptance,
+  mean acceptance length 2.81, per-position 0.871/0.610/0.327. That third
+  position is doing very little, which is what reusing a single MTP module three
+  times looks like — compare the Qwen3.6-35B-A3B recipe's 0.910/0.759/0.654 with
+  the same k=3. k=2 is worth measuring against this before k=3 is treated as
+  settled; the value is kept at 3 only because it matches the upstream vLLM
+  reference command. --load-format instanttensor matches
+  the rest of the registry and matters more here than anywhere else in it, since
+  this is by far the largest checkpoint at 65.5 GB — roughly 3x the 20-GiB NVFP4
+  recipes. It needs the instanttensor package in the image, which
+  eugr/spark-vllm:latest ships (PyPI has x86_64 wheels only, so an image without
+  it must fall back to fastsafetensors). Whether it composes with the MXFP4
+  expert weight-name remapping that bailing_moe_v3 applies at load time is the
+  one thing this recipe does that no measured recipe in the registry has
+  exercised. It composes: no remap errors, and the loader is credited by name
+  in the log ("Loading safetensors using InstantTensor loader"). Sampling
+  defaults per the model
+  card are temperature=0.6, top_p=0.95, top_k=20; thinking is on by default in
+  both the chat template and the ling3 parser, and is disabled per-request with
+  chat_template_kwargs {"enable_thinking": false}.
+model: inclusionAI/Ling-3.0-flash-fp4
+container: eugr/spark-vllm:latest
+mods: []
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+  max_num_seqs: 16
+  served_model_name: ling-3.0-flash
+  load_format: instanttensor
+  speculative_config: '{"method":"mtp","num_speculative_tokens":3}'
+env:
+  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
+  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
+  # compiled kernels land in /tmp and die with the --rm container.
+  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+  # vLLM defaults this to 'highest', which leaves GB10's TF32 tensor cores idle
+  # for fp32 matmuls and makes torch.compile warn about it. 'high' enables them.
+  # Note this is not free on this checkpoint specifically: config.json sets
+  # router_dtype fp32, and the vendor's SGLang command passes
+  # --enable-fp32-lm-head, so the router and head are deliberately fp32 paths.
+  # TF32 carries a ~10-bit mantissa, and the router does a top-8-of-512
+  # selection where near-ties decide expert routing. Set here on the assumption
+  # the speed is worth it; the quality effect is unmeasured, and 'highest'
+  # is the revert.
+  VLLM_FLOAT32_MATMUL_PRECISION: high
+command: |
+  vllm serve inclusionAI/Ling-3.0-flash-fp4 \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --load-format {load_format} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --enable-chunked-prefill \
+    --enable-prefix-caching \
+    --mamba-cache-mode align \
+    --enable-auto-tool-choice \
+    --tool-call-parser ling3 \
+    --reasoning-parser ling3 \
+    --speculative-config '{speculative_config}'
+recipe_version: "2"
+name: Ling-3.0-flash-FP4-inclusionAI-DGX-Spark
+cluster_only: false
+solo_only: false
