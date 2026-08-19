@@ -1,0 +1,201 @@
+description: >-
+  Google DiffusionGemma 26B-A4B-it in NVIDIA's ModelOpt NVFP4 quantization on a
+  single DGX Spark. This is a discrete diffusion LLM, not an autoregressive one:
+  the Gemma 4 MoE backbone (25.2B total / 3.8B active, 30 layers, 128 experts
+  with top-8 routing plus 1 shared) is run in two modes off the same weights —
+  an encoder pass with causal attention that fills the KV cache from the prompt,
+  and a decoder pass with bidirectional attention that denoises a fixed 256-token
+  canvas in place. Across canvases generation is still left-to-right; within a
+  canvas all 256 positions denoise in parallel, up to 48 steps, with a
+  self-conditioning gated MLP feeding each step the probability-weighted
+  embedding of the previous step's prediction. That trades a much worse TTFT for
+  a much better per-request generation rate — upstream measured 489 ms TTFT and
+  ~1282 tok/s per-request generation against 53 ms and ~205 tok/s for the
+  autoregressive Gemma 4 26B-A4B on one H100.
+
+  The flags started from the dgx_spark_gb10 hardware override in the upstream
+  vLLM recipe (vllm-project/recipes, models/Google/diffusiongemma-26B-A4B-it.yaml),
+  which marks GB10 as verified for exactly this nvidia/…-NVFP4 checkpoint — that is
+  where gpu_memory_utilization 0.8, max_num_seqs 8, TRITON_ATTN, prefix caching and
+  the two JSON overrides come from. Two things here deviate from it and both are
+  measured below: the loader is instanttensor rather than fastsafetensors, and
+  --language-model-only is added because the vision path in this container build
+  kills the engine.
+
+  MEASURED 2026-08-19 on vLLM 0.27.2rc1.dev209+gf9f066d19, torch 2.13.0+cu130,
+  CUDA 13.0, single node, across four launches. Weights load in 8.69 s at 2.49
+  GB/s with instanttensor ("Loading safetensors using InstantTensor loader" is
+  credited by name in the log); the two fastsafetensors launches took 13.4 s and
+  14.4 s for the same 17.5 GB, so instanttensor is worth roughly 1.6x here and is
+  what this recipe sets. Model loading occupies 16.89 GiB. init engine (profile,
+  create kv cache, warmup) took 135.63 s cold with 45.35 s of compilation, then
+  43-76 s on later launches with the compile cache warm (0.5-24.7 s compilation).
+  vLLM logs quantization=modelopt_fp4 and picks the FLASHINFER_CUTLASS NVFP4 MoE
+  backend, so the experts run a real FP4 path rather than weight-only
+  decompression; attention resolves to TRITON_ATTN as asked and the KV cache comes
+  up fp8_e4m3 without any --kv-cache-dtype flag. Available KV cache measured
+  between 62.5 and 79.2 GiB depending on launch (5.48M to 6.95M tokens, 20.9x to
+  26.5x concurrency at the full 262144), the spread being how much host memory was
+  free at profile time — even the low end is an order of magnitude more headroom
+  than the NVFP4 text recipes in this registry get.
+
+  Generation throughput on this node is nothing like the H100 numbers above.
+  Measured single-request: 118-152 tok/s over 1683-1791-token completions, and
+  0.5-4.2 s wall for short answers. Eight concurrent requests: 6387 tokens in
+  26.96 s, 237 tok/s aggregate. So the diffusion sampler's parallel denoising does
+  not turn GB10 into an H100 — the interesting property here is that per-request
+  speed stays in that range as concurrency rises, not the headline 1100+ tok/s.
+  Verified serving: correct math and code answers with reasoning split into its
+  own field (the gemma4 parser fills message.reasoning, not reasoning_content),
+  thinking suppressed per-request via chat_template_kwargs {"enable_thinking":
+  false} (0 reasoning chars, "Paris" for a one-word question), and a correctly
+  parsed get_weather tool call with finish_reason tool_calls.
+
+  One hard limitation, found by crashing the engine with it. Any image request
+  kills the server on this build: DiffusionGemmaForConditionalGeneration.__init__
+  calls a bare super().__init__() and so never runs the Gemma4ForConditionalGeneration
+  constructor that sets _enable_mm_lora, and gemma4_mm.py's _process_image_input
+  reads that attribute on every image — AttributeError, EngineDeadError, server
+  gone, 500 to the client. That is a vLLM bug, not a checkpoint problem, and it is
+  why --language-model-only is in the command. With it, an image request is
+  rejected with a clean 400 ("At most 0 image(s) may be provided in one prompt")
+  and the engine survives; verified. Drop the flag once the upstream fix lands to
+  get the vision tower back (the checkpoint itself supports images and video, at a
+  default 280 visual tokens per image, budgets 70/140/280/560/1120 via
+  --mm-processor-kwargs '{"max_soft_tokens": N}').
+
+  Sampling parameters are more restricted than the OpenAI API suggests: vLLM
+  rejects temperature, min_p, seed, min_tokens, logit_bias, bad_words and
+  allowed_token_ids with a 400 on diffusion models ("not yet supported with
+  diffusion models"), so a client that always sends temperature will fail every
+  request. The denoising schedule in generation_config.json is where that
+  behaviour lives instead.
+
+  Several registry conventions are deliberately absent, and the reasons matter.
+  There is no --speculative-config: vLLM's DiffusionConfig reuses the
+  speculative-decoding data path to carry the canvas (canvas_length becomes
+  num_speculative_tokens), so the usual MTP block would collide with generation
+  itself rather than accelerate it. There is no --async-scheduling and no
+  --enable-chunked-prefill; the "max-throughput text profile" the other recipes
+  share is an autoregressive shape, and the Spark-verified override omits both.
+  --quantization is not passed: config.json declares quant_method modelopt and
+  vLLM autodetects it. --kv-cache-dtype is not passed either, because the same
+  quantization_config carries kv_cache_scheme {type: float, num_bits: 8}, which
+  vLLM's modelopt path reads directly (modelopt.py handles the dict form as well
+  as the older kv_cache_quant_algo string) — the KV cache lands at fp8 without
+  the flag. VLLM_USE_V2_MODEL_RUNNER=1, which NVIDIA's model card sets, is also
+  not here: this vLLM build forces the V2 model runner whenever
+  ModelConfig.is_diffusion is true, which it is for any checkpoint carrying
+  canvas_length, so the env var would be a no-op.
+
+  The quantization is narrower than the NVFP4 label suggests. The ignore list
+  covers lm_head, *mlp*, *router*, *self_attn*, *self_conditioning*,
+  *vision_tower* and *embed_vision*, so NVFP4 (4-bit weights and activations,
+  group size 16, static scales) applies to the MoE expert Linears and little
+  else; attention, the dense MLP path, the router, the self-conditioning MLP and
+  the ~550M-parameter vision tower stay bf16. That is 18.8 GB on disk against
+  127.6 GB of unified memory. NVIDIA reports the NVFP4 build within ~1 point of
+  the bf16 baseline across GPQA Diamond, AIME 2025, GSM8K, IFEval, HumanEval,
+  MMMLU and MMLU Pro, with thinking on.
+
+  KV is unusually cheap for a 262144-token context, which is why 0.8 is
+  comfortable here. Only 5 of 30 layers use full attention, and those carry 2 KV
+  heads at global_head_dim 512 — roughly 10 KiB/token at fp8, so about 2.5 GiB at
+  the full context. The other 25 layers are sliding-window at 1024 tokens, so
+  their cost is a per-sequence constant (~100 MiB) rather than a function of
+  context length. sparkrun's own estimator does not know this — it prints 30.00
+  GB of KV at the full context because it sizes all 30 layers as full attention
+  at 8 KV heads x head_dim 256, the same overshoot it makes on the hybrid Ling
+  recipe, and the engine went on to report 62.5-79.2 GiB of real KV headroom
+  against that 30.00 GB estimate. The pressure on this model is elsewhere: the diffusion state
+  buffers scale as max_num_seqs x canvas_length x vocab_size, and with a 262144
+  vocab that is what makes max_num_seqs the dangerous knob. Upstream caps it at 4
+  for 80 GB cards and raises it to 8 only in the GB10 override, on the strength
+  of unified memory. If a launch OOMs, 8 -> 4 is the first move, before touching
+  gpu_memory_utilization.
+
+  --override-generation-config '{"max_new_tokens": null}' is not cosmetic. The
+  checkpoint's generation_config.json sets max_new_tokens 256 (one canvas), and
+  without the override that ceiling silently clamps every request. The rest of
+  that file is left alone on purpose: it already carries the sampler the model
+  card prescribes — EntropyBoundSamplerConfig with entropy_bound 0.1,
+  max_denoising_steps 48, the 0.8 -> 0.4 temperature schedule (t_max/t_min),
+  confidence_threshold 0.005 and stability_threshold 1 — and vllm's
+  diffusion_gemma sampler reads those keys directly, raising if the sampler_config
+  is missing or not EntropyBound. So the --hf-overrides
+  '{"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1}' that the
+  generic upstream guide shows is redundant for this checkpoint and is omitted.
+  max_denoising_steps is the one sampler knob worth reaching for; it can be set
+  through --diffusion-config alongside canvas_length, and lowering it trades
+  quality for speed on easy prompts.
+
+  Thinking is on by default via --default-chat-template-kwargs
+  '{"enable_thinking": true}', which matches NVIDIA's own serve command and is
+  also the practical requirement for tool calling: upstream notes function calling
+  works best in thinking mode, and that non-thinking mode may answer directly
+  instead of emitting a call. Disable per-request with chat_template_kwargs
+  {"enable_thinking": false}. Both parsers are gemma4, and both are registered
+  under that name in this image.
+
+  --language-model-only is preferred over --limit-mm-per-prompt '{"image": 0}';
+  vLLM documents it as exactly equivalent to setting every modality limit to zero,
+  and both produce the same 400, but the single flag says what it means. The
+  loader is --load-format instanttensor, which needs the instanttensor package in
+  the image — eugr/spark-vllm:latest has it (PyPI ships x86_64 wheels only), and a
+  container without it must fall back to the fastsafetensors the upstream override
+  specifies. Container support was checked by reading the image rather than
+  trusting a version number: eugr/spark-vllm:latest as of 2026-08-18 is
+  0.27.2rc1.dev209+gf9f066d19 and ships
+  vllm/model_executor/models/diffusion_gemma.py along with vllm/config/diffusion.py
+  and the --diffusion-config CLI flag.
+model: nvidia/diffusiongemma-26B-A4B-it-NVFP4
+container: eugr/spark-vllm:latest
+mods: []
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_seqs: 8
+  served_model_name: diffusiongemma-26b-a4b
+  load_format: instanttensor
+  attention_backend: TRITON_ATTN
+  diffusion_config: '{"canvas_length":256}'
+  override_generation_config: '{"max_new_tokens": null}'
+  default_chat_template_kwargs: '{"enable_thinking": true}'
+env:
+  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
+  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
+  # compiled kernels land in /tmp and die with the --rm container.
+  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+command: |
+  vllm serve nvidia/diffusiongemma-26B-A4B-it-NVFP4 \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --load-format {load_format} \
+    --attention-backend {attention_backend} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --language-model-only \
+    --enable-prefix-caching \
+    --diffusion-config '{diffusion_config}' \
+    --override-generation-config '{override_generation_config}' \
+    --default-chat-template-kwargs '{default_chat_template_kwargs}' \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4
+recipe_version: "2"
+name: DiffusionGemma-26B-A4B-it-NVFP4-NVIDIA-DGX-Spark
+cluster_only: false
+solo_only: false
