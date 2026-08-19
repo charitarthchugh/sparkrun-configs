@@ -1,0 +1,23 @@
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -16,6 +16,7 @@
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.linear import ReplicatedLinear
++from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+ from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     UnquantizedEmbeddingMethod,
+@@ -317,7 +318,10 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+     def compute_candidates(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        if not isinstance(self.lm_head.quant_method, UnquantizedEmbeddingMethod):
++        if not isinstance(
++            self.lm_head.quant_method,
++            (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
++        ):
+             raise ValueError(
+                 "DFlash2 requires an unquantized target LM head for candidate TopK."
+             )

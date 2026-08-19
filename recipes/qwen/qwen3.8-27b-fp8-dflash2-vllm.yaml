@@ -1,0 +1,134 @@
+description: >-
+  Qwen's own FP8 checkpoint of Qwen3.8-27B on a single DGX Spark, drafting with
+  z-lab/Qwen3.8-27B-DFlash2 instead of the checkpoint's built-in MTP head. This
+  is the qwen3.8-27b-fp8-vllm recipe with the speculator swapped and nothing
+  else changed, so the two are directly comparable — same 0.7 memory budget,
+  same 262144 context, same FP8 KV, same multimodal profile and parsers. Read
+  that recipe for the tuning rationale; only the speculative decoding differs
+  here. DFlash2 is a block-diffusion drafter: it predicts a whole block of
+  tokens in one pass, keeps the top candidates at every position, and traces a
+  single coherent path through them with a lightweight selector, with two-tap
+  dynamic convolutions keeping the draft from decaying toward the end of the
+  block. Decoding is lossless — greedy output matches the target exactly and
+  sampling preserves its distribution — so the only thing at risk versus MTP is
+  acceptance rate, never output quality. The drafter is 1.92B BF16 params, five
+  sliding-window (2048) attention layers reading target hidden states after
+  layers 5, 19, 33, 47 and 61, with block_size 8; num_speculative_tokens is 7
+  because vLLM counts drafted tokens while the checkpoint's block_size counts
+  the verify window, which includes the current token. z-lab/Qwen3.8-27B-DFlash2
+  is a mirror of incoai/Qwen3.8-27B-DFlash2 and the two are interchangeable.
+  Upstream reports 5.46 acceptance length on GSM8K and 4.39 on HumanEval against
+  MTP's 5.02 and 3.91, for 3.43x over autoregressive at concurrency 1 — but that
+  is SGLang on an H200 with FlashAttention 3, at seven draft tokens, and none of
+  it transfers to a Spark unexamined. The number worth watching here is
+  acceptance against MTP on this node, and DFlash2 wins it. Measured on this node 2026-08-19, against the MTP
+  baseline run back to back on the same day with the same two prompts at 800
+  completion tokens each, bs1: a red-black tree implementation for the code
+  shape and a no-lists prose explanation for the discursive shape. MTP at k=3
+  gave 11.6 and 15.4 tok/s on code and 9.7 and 9.5 on prose, at mean acceptance
+  length 2.92-3.80 and 1.46-1.91 respectively.
+  DFlash2 at k=7 gave 22.2 and 20.6 tok/s on code and 14.3 and 16.3 on prose, at
+  mean acceptance length 3.80-4.44 and 1.83-2.48. So roughly 1.5-1.7x MTP on
+  prose and a smaller but real gain on code — and note where the win comes from:
+  both speculators degrade on discursive text, but DFlash2 degrades from a much
+  higher ceiling, and its seven positions keep contributing where MTP has only
+  three to offer. The other drafter available for this checkpoint,
+  RadixArk/Qwen3.8-27B-DSpark, was measured in the same session and came out
+  barely ahead of MTP — 13.9 and 22.4 tok/s on code, 10.4 and 9.9 on prose, the
+  latter inside run-to-run noise, and at a slightly worse KV cost — so DFlash2 is
+  the one to reach for. DSpark needs no container patch, which is its only
+  advantage here; if that matters more than throughput it is worth a look, and it
+  works out of the box in this image with "method":"dspark" at
+  num_speculative_tokens 7. Note that its enable_adaptive_verification flag, the
+  whole point of its confidence head, cannot be used on Qwen3.8: it fails at
+  engine init with "Adaptive verification trims verification requests on device,
+  which the GDNAttentionBackend attention backend does not support". What this
+  costs is KV. The drafter's weights and its own cache took the GPU KV cache
+  from MTP's 1,307,791 tokens at 4.99x concurrency down to 881,048 at 3.36x —
+  about 450k tokens, or a third of the pool, for the extra speed. Model loading
+  went from 31.15 to 32.18 GiB. If concurrency at full context matters more than
+  single-stream latency, that trade is a bad one and MTP is the better default.
+  Worth knowing before choosing this recipe at all: the FP8 MTP baseline it beats
+  so decisively is not the fastest thing in this registry. The Unsloth NVFP4
+  recipe with its own MTP head, measured the same day on the same prompts, gave
+  20.4 and 18.4 tok/s on code and 15.6 and 15.3 on prose while holding 1,530,393
+  KV tokens at 5.84x — faster than this recipe on prose and far roomier. Staying
+  on the official FP8 numerics is a real reason to run this one; raw speed is
+  not. This recipe cannot
+  run on a stock image. vLLM's DFlash2 support is PR #52816, still open as of
+  2026-08-19, and the mods/dflash2-vllm entry overlays its seven runtime files
+  onto the vLLM in the container at launch; see that mod's README for why the
+  SGLang route is not available either. The mod is a no-op once the PR merges
+  and reaches the image, at which point it should be dropped from mods: here.
+  The method string stays "dflash" — DFlash2 is selected from the draft
+  checkpoint's DFlash2DraftModel architecture, not by a separate method name.
+  One hard constraint comes with it: the speculator's candidate TopK reads the
+  target's lm_head directly and raises unless it is unquantized. This checkpoint
+  qualifies, because Qwen lists lm_head in modules_to_not_convert. The Unsloth
+  NVFP4 build does not and cannot be used here — it quantizes lm_head to FP8
+  W8A8 via a re:.*lm_head entry in its compressed-tensors config_groups, and
+  fails at engine init. A ModelOpt NVFP4 build that excludes lm_head, such as
+  Inferact/Qwen3.8-27B-NVFP4, does work; it was measured at 19.9 and 23.3 tok/s
+  on code and 17.0 and 17.8 on prose with 1,060,784 KV tokens at 4.05x, but it
+  additionally needs the mod's second patch, because vLLM's ModelOpt path hands
+  an excluded lm_head an UnquantizedLinearMethod that the PR's guard does not
+  accept. See the mod README if you want to go that way. The MTP head still ships in the checkpoint and
+  simply goes unused while DFlash2 is drafting. One more thing worth knowing on
+  a multimodal profile: vLLM warns at startup that the drafter does not support
+  external multimodal embeddings, so image embeddings from the target are never
+  passed to it and the draft runs on text-only inputs. Drafting quality on
+  image-grounded turns should be expected to suffer; none of the numbers above
+  cover that case.
+model: Qwen/Qwen3.8-27B-FP8
+container: eugr/spark-vllm:latest
+mods:
+  - "@charitarth/dflash2-vllm"
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  max_num_batched_tokens: 32768
+  max_num_seqs: 16
+  limit_mm_per_prompt: '{"image": 1, "video": 0}'
+  mm_processor_kwargs: '{"size": {"longest_edge": 2097152, "shortest_edge": 65536}}'
+  served_model_name: qwen3.8-27b
+  speculative_config: '{"method":"dflash","model":"z-lab/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
+env:
+  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
+  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
+  # compiled kernels land in /tmp and die with the --rm container.
+  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+command: |
+  vllm serve Qwen/Qwen3.8-27B-FP8 \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --load-format instanttensor \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --limit-mm-per-prompt '{limit_mm_per_prompt}' \
+    --mm-processor-kwargs '{mm_processor_kwargs}' \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --speculative-config '{speculative_config}'
+recipe_version: "2"
+name: Qwen3.8-27B-FP8-DFlash2-DGX-Spark
+cluster_only: false
+solo_only: false
