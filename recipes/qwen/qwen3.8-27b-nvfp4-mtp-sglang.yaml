@@ -1,0 +1,81 @@
+description: >-
+  The qwen3.8-27b-nvfp4-dflash2-sglang recipe with the DFlash2 drafter swapped
+  for the checkpoint's own MTP head, and nothing else changed - same RadixArk
+  NVFP4 checkpoint, same 0.80 memory fraction, same 2048 prefill chunk, same
+  bf16 SSM state, same 64-slot mamba pin. Read that recipe for the tuning
+  rationale; only the speculator differs here. This is the roomy option: it
+  holds 1,791,746 KV tokens against the DFlash2 recipe's 1,031,700, because the
+  in-checkpoint head needs no second KV cache and only 4.78 GB of intermediate
+  SSM state against DFlash2's 9.56 GB. It pays for that in speed. Measured on
+  this node 2026-08-24 with the same probe - 8 concurrent ~31k-token prompts,
+  1024 completion tokens, shared prefix on half - it gives 58.82 tok/s aggregate
+  against DFlash2's 62.55-65.25, a TTFT median of 10.06 s against 10.0-10.4, and
+  at bs1 24.3-25.8 tok/s on code and 19.9-20.9 on prose (mean 22.74) against
+  DFlash2's mean of 28.0-29.0. So roughly 10% less aggregate throughput and 20%
+  less single-stream, for 74% more KV pool. Reach for this one when concurrency
+  at long context matters more than speed; otherwise the DFlash2 sibling is the
+  default. Its real value is as a controlled comparison, and it is what shows
+  that most of the win over the vLLM recipes is the engine rather than the
+  drafter: this cell and qwen3.8-27b-nvfp4-vllm run the same speculation method
+  on the same model family, and SGLang's 58.82 against vLLM's 37.09-42.47 is
+  +38% from the engine alone, with DFlash2 adding a further +11% on top. The
+  EAGLE spelling is the cookbook's: --speculative-algorithm EAGLE with steps 3,
+  eagle-topk 1 and 4 draft tokens drives the in-checkpoint MTP head, and NEXTN
+  is an alias of the same algorithm. Unlike the DFlash2 cell, this one could in
+  principle take --enable-linear-replayssm-spec, which the cookbook says moves
+  draft intermediates onto a fixed ring and returns D to 0 in the mamba ratio;
+  that flag rejects DFlash2 outright as a non-KDA model but was never tried here
+  on the MTP path, so treat it as an untested lead rather than a recommendation.
+  Same untested surface as the sibling: text only, no image or video request was
+  sent, the parsers were not exercised against a real tool-calling harness, and
+  no output-quality comparison was made. Same dev-tag caveat too -
+  lmsysorg/sglang:dev-qwen38-27b-dflash2 at sglang 0.0.0.dev1+g5f55db35e.
+model: RadixArk/Qwen3.8-27B-NVFP4
+container: lmsysorg/sglang:dev-qwen38-27b-dflash2
+mods: []
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  max_model_len: 262144
+  mem_fraction_static: 0.80
+  chunked_prefill_size: 2048
+  mamba_ssm_dtype: bfloat16
+  mamba_radix_cache_strategy: extra_buffer_lazy
+  max_mamba_cache_size: 64
+  max_running_requests: 16
+  served_model_name: qwen3.8-27b
+  speculative_num_steps: 3
+  speculative_eagle_topk: 1
+  speculative_num_draft_tokens: 4
+env:
+  CUTE_DSL_ARCH: sm_121a
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+command: |
+  sglang serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tp-size {tensor_parallel} \
+    --trust-remote-code \
+    --context-length {max_model_len} \
+    --mem-fraction-static {mem_fraction_static} \
+    --attention-backend flashinfer \
+    --chunked-prefill-size {chunked_prefill_size} \
+    --mamba-ssm-dtype {mamba_ssm_dtype} \
+    --mamba-radix-cache-strategy {mamba_radix_cache_strategy} \
+    --max-mamba-cache-size {max_mamba_cache_size} \
+    --max-running-requests {max_running_requests} \
+    --speculative-algorithm EAGLE \
+    --speculative-num-steps {speculative_num_steps} \
+    --speculative-eagle-topk {speculative_eagle_topk} \
+    --speculative-num-draft-tokens {speculative_num_draft_tokens} \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
+recipe_version: "2"
+name: Qwen3.8-27B-NVFP4-MTP-SGLang-DGX-Spark
+cluster_only: false
+solo_only: false
