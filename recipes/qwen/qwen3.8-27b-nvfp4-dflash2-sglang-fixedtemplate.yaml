@@ -1,0 +1,179 @@
+description: >-
+  RadixArk's ModelOpt NVFP4 checkpoint of Qwen3.8-27B served with SGLang on a
+  single DGX Spark, drafting with the DFlash2 block-diffusion speculator. This
+  is the SGLang cookbook's DGX Spark cell for this model, tuned and measured
+  here rather than taken on faith - upstream validated all 48 GB10 cells to
+  boot-and-serve only, with no throughput or acceptance numbers taken, so every
+  figure below is from this node. It is the fastest Qwen3.8 configuration in
+  this registry for concurrent agent traffic, and it is faster by a wide margin.
+  Measured 2026-08-24 against the qwen3.8-27b-nvfp4-vllm recipe (vLLM + the
+  checkpoint's own MTP head), both cold-started and driven by the same probe: 8
+  concurrent requests carrying ~31k-token prompts with a shared prefix on half
+  of them, 1024 completion tokens each, plus the house bs1 code and prose
+  prompts at 800 tokens. Aggregate generation across the 8 streams came out at
+  62.55-65.25 tok/s here against 37.09-42.47 for the vLLM recipe, and time to
+  first token at a 10.0-10.4 s median against 57-114 s. That TTFT gap is the
+  number that matters for agent work and it is roughly 11x. At bs1 this recipe
+  gives 32.6-35.3 tok/s on code and 21.5-25.0 on prose (mean 28.0-29.0) against
+  the vLLM recipe's 22.7-24.4 and 18.4-19.6 (mean 20.5-22.0). Run-to-run spread
+  is about 4% here and 13% on the vLLM side, so treat gaps under ~15% as noise.
+  Most of the win is the engine, not the drafter, which is worth knowing before
+  attributing it to DFlash2. Holding speculation fixed at the checkpoint's MTP
+  head and changing only the engine - see the qwen3.8-27b-nvfp4-mtp-sglang
+  sibling - gives 58.82 tok/s aggregate, so vLLM to SGLang alone is +38%, and
+  swapping MTP for DFlash2 adds a further +11% aggregate and +28% at bs1. The
+  sibling is the recipe to reach for if the KV pool ever binds, because it holds
+  1,791,746 tokens against this one's 1,031,700 - DFlash2 buys its speed with a
+  second bf16 KV cache of 19.7 GB for the drafter plus 9.56 GB of intermediate
+  SSM state for its 8-token verify window, about 29 GB in all. The one result
+  worth overturning a prior on: speculative decoding still pays at 8 concurrent
+  streams. Turning it off entirely doubles the KV pool to 2,134,328 tokens and
+  still loses 28% of aggregate throughput and 56% of bs1, which is the opposite
+  of the usual "speculation is a batch-size-1 trick" intuition. The reason is
+  that a dense 27B on GB10 is memory-bandwidth-bound rather than compute-bound:
+  the ~17 GB of NVFP4 weights are read every decode step regardless of batch
+  size, so verifying 8 drafted tokens inside a step you already paid for is
+  nearly free. Long agent contexts add a KV term that does scale with
+  concurrency - roughly 1.0 GB per sequence per step at 31k tokens and 32.8
+  KB/token of fp8 KV, so ~8 GB on top of the weights at 8 streams - and that
+  term is what will eventually erode speculation's advantage as contexts grow,
+  since acceptance reduces weight reads but not KV reads. Re-measure before
+  assuming this ranking holds at much longer contexts. The sizing knobs were
+  measured, not inherited. mem-fraction-static is 0.80 because the cookbook
+  reports 15 of 48 cells killed by DGX OS earlyoom at 0.85, where 0.85 of 128 GB
+  leaves about 8 GB and the first long prefill dips under earlyoom's SIGTERM
+  threshold; every launch here was clean at 0.80, which leaves 15.8 GB free
+  after pools. chunked-prefill-size 2048 is the cookbook value and both
+  neighbours were tried: 8192 costs 14% aggregate and pushes the TTFT median to
+  15.5 s, while 1024 is indistinguishable from 2048 (65.43 vs 65.25) so 2048
+  stays on simplicity grounds. mamba-ssm-dtype is bfloat16, which resolves the
+  cookbook's explicit "measure both, it goes either way with speculation"
+  caveat in bf16's favour on this node - float32 doubles the state pool to 28 GB,
+  drops KV to 752,100 tokens and costs 9% aggregate. max-mamba-cache-size is
+  pinned at 64 rather than left to --mamba-full-memory-ratio, because the pin is
+  exact: it is target concurrency 16 times S=4 state slots per request under
+  extra_buffer_lazy, and the engine divides the state pool by S alone while
+  sizing the speculative verify buffer separately, so folding DFlash2's D=8 into
+  the pin would over-provision. The engine confirms max_running_requests=16 at
+  boot. kv-cache-dtype is deliberately not set: the checkpoint declares
+  kv_cache_quant_algo FP8 and SGLang's default auto honors it, logging
+  "KV Cache is allocated. dtype: torch.float8_e4m3fn" with the checkpoint's own
+  calibration scales. Two checkpoint alternatives were measured and both lose.
+  Qwen's official FP8 build on this same cell gives 49.81 aggregate and 20.21 at
+  bs1 with the pool halved to 528,971 tokens - staying on official numerics
+  costs about a quarter of agent throughput and half the pool here, which is a
+  real reason to run it but not a performance one. The bs1 ratio between the two
+  came out 1.44x against the 1.65x that weight bytes alone predict (17 GB vs 28
+  GB), the difference being the KV and SSM traffic they share. RadixArk also
+  publishes a BF16-lm_head variant; this recipe uses the FP4-head export, and
+  DFlash2 runs on it because SGLang's candidate selector projects through
+  quantized heads. That is a genuine difference from the vLLM DFlash2 path,
+  where qwen3_dflash2.py requires an unquantized target lm_head and this
+  checkpoint would be rejected. --enable-linear-replayssm-spec is not set and
+  cannot be: it fails at engine init with "requires a KDA (kimi_linear) model;
+  got a non-KDA model", so DFlash2's 9.56 GB of verify intermediates cannot be
+  moved onto a fixed ring the way the cookbook describes for MTP. What this
+  recipe does not have measured, and should not be assumed: image and video
+  input. SGLang serves this through the Qwen3-VL path with the vision tower
+  live, but every number here is text-only and no image request was sent. Tool
+  calls and the reasoning parser are wired to the cookbook's qwen3_coder and
+  qwen3 - qwen3_coder decodes this checkpoint's nested <function=>/<parameter=>
+  payload, which is a different shape from what the hermes parser reads - but
+  neither parser was exercised against a real tool-calling harness here. Output
+  quality was not compared against the Unsloth NVFP4 or official FP8 builds at
+  all; this is a throughput result only. Two operational caveats. TTFT max sits
+  near 63 s against the 10 s median in every cell measured, because with 8
+  long prompts arriving together one request always waits out the others'
+  prefill - that is queueing, not a defect, but the eighth agent's experience is
+  much worse than the median suggests. And the container is a dev tag,
+  lmsysorg/sglang:dev-qwen38-27b-dflash2, carrying sglang 0.0.0.dev1+g5f55db35e;
+  it has a linux/arm64 variant, which is what makes this route possible at all -
+  the note in mods/dflash2-vllm saying no image can run DFlash2 predates it and
+  is now stale for SGLang. Expect the tag to drift and re-measure when it does.
+  One reporting quirk worth knowing if you watch dashboards: usage
+  prompt_tokens_details.cached_tokens comes back 0 from both SGLang and vLLM
+  here even while the engine logs real prefix-cache hits, so a client-side cache
+  rate of 0% is a telemetry gap rather than a cache miss.
+  This is the fixed-chat-template variant of qwen3.8-27b-nvfp4-dflash2-sglang.
+  Everything above is inherited from that recipe and unchanged - same
+  checkpoint, same container, same speculator, same sizing, same measured
+  numbers - and the only difference is the chat template, which is why the two
+  are kept as separate files rather than one recipe with a knob: the template
+  changes model behaviour, not throughput, and reverting is a matter of running
+  the other name. Run that one if you want the checkpoint's own template.
+  Here the chat template is not the checkpoint's. mods/qwen38-fixed-chat-template
+  drops froggeric's community-fixed Qwen template into the container and
+  --chat-template points at it, because the official Qwen3.8 template hardcodes
+  reasoning_effort to xhigh - which spends most of a capped token budget
+  thinking and can return empty content - and prepends duplicate blank
+  <think></think> blocks to real thoughts in history, which is exactly the shape
+  of prefix-cache invalidation the numbers above depend on not happening. The
+  fixed template defaults to medium, injecting no instruction text at all, so
+  requests that want the old depth must now pass chat_template_kwargs with
+  reasoning_effort xhigh. It is pinned to revision 756cfb69 (v22.4) and vendored
+  in the mod rather than fetched, and it keeps Qwen's canonical XML tool format,
+  so the qwen3_coder parser set below is still the right one. See the mod README
+  for the rest, including why its .jinja extension cannot be renamed. None of
+  the throughput numbers above were re-measured after this change; the template
+  alters how prompts render, not how the engine decodes, but the shorter default
+  reasoning preamble will move end-to-end latency on real traffic.
+  Four things were verified on this recipe after wiring the template in, all on
+  2026-08-25: SGLang logs "Detected user specified Jinja chat template with
+  content format: openai" and independently auto-detects qwen3 and qwen3_coder
+  from it, matching the parsers set below; reasoning_effort medium, xhigh and
+  enable_thinking false each produce distinctly different completions, so the
+  kwargs really reach the template; a base64 image request comes back correct,
+  which is the first image ever put through this recipe and retires the caveat
+  above for the still-image case; and a full tool round-trip parses, including
+  an assistant history turn whose arguments field is a serialized JSON string -
+  the exact payload the official template crashes on. Video is still untested.
+model: RadixArk/Qwen3.8-27B-NVFP4
+container: lmsysorg/sglang:dev-qwen38-27b-dflash2
+mods:
+  - "@charitarth/qwen38-fixed-chat-template"
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  max_model_len: 262144
+  chat_template: /workspace/mods/qwen38-fixed-chat-template/chat_template.jinja
+  mem_fraction_static: 0.80
+  chunked_prefill_size: 2048
+  mamba_ssm_dtype: bfloat16
+  mamba_radix_cache_strategy: extra_buffer_lazy
+  max_mamba_cache_size: 64
+  max_running_requests: 16
+  served_model_name: qwen3.8-27b
+  draft_model: incoai/Qwen3.8-27B-DFlash2
+  speculative_num_draft_tokens: 8
+env:
+  CUTE_DSL_ARCH: sm_121a
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+command: |
+  sglang serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tp-size {tensor_parallel} \
+    --trust-remote-code \
+    --context-length {max_model_len} \
+    --mem-fraction-static {mem_fraction_static} \
+    --attention-backend flashinfer \
+    --chunked-prefill-size {chunked_prefill_size} \
+    --mamba-ssm-dtype {mamba_ssm_dtype} \
+    --mamba-radix-cache-strategy {mamba_radix_cache_strategy} \
+    --max-mamba-cache-size {max_mamba_cache_size} \
+    --max-running-requests {max_running_requests} \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path {draft_model} \
+    --speculative-num-draft-tokens {speculative_num_draft_tokens} \
+    --chat-template {chat_template} \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
+recipe_version: "2"
+name: Qwen3.8-27B-NVFP4-DFlash2-SGLang-FixedTemplate-DGX-Spark
+cluster_only: false
+solo_only: false
