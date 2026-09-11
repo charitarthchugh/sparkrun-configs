@@ -1,0 +1,125 @@
+description: >-
+  Ling-3.0-flash on a single DGX Spark with the checkpoint's own NextN/MTP head
+  as the speculator, which is what upstream's quickstart recommends
+  (--speculative-algorithm NEXTN) and what this registry should probably have
+  reached for first. The head is real and it ships in the fp4 build: layer 42
+  carries 3095 tensors including eh_proj, enorm, hnorm and final_layernorm, the
+  standard MTP module shape, and config declares num_nextn_predict_layers 1.
+  The reason it matters here is the KV cache, and the reason is architectural.
+  That head's attention is MLA, not MHA - it has kv_a_proj_with_mqa and
+  kv_b_proj, and mtp_use_kda is false - so one layer of it costs about 1.1
+  KiB/token. The DSpark drafter in the ling-3.0-flash-fp4-dspark-sglang sibling
+  is 5 layers of plain MHA at 32 key/value heads and costs a measured 74.5
+  KiB/token, roughly 66 times more, which collapsed that recipe's pool to
+  max_total_num_tokens=150131 against a declared 262144 context. So this recipe
+  should keep speculation and keep the full context window, which is the
+  combination neither sibling manages.
+  MEASURED 2026-09-11 on sglang 0.0.0.dev1+g0e5e40d8f, torch 2.13.0+cu130, CUDA
+  13.0, against both siblings on the same 12-cell profile
+  (benchmarking/ling-3.0-flash-dspark.yaml, depth 0/4096/16384 x concurrency
+  1/2/4/8, runs 1). The memory prediction held exactly. max_total_num_tokens
+  came out 2022172, which is 7.7x the full 262144 context, against the DSpark
+  arm's 150131 and 0.57x - a 13.5x larger pool. The reason is visible in the two
+  KV allocations: the MLA target takes 15.19 GB at 7.34 KiB/token and the MTP
+  head takes 2.17 GB at 1.05 KiB/token, where DSpark's drafter took 11.46 GB at
+  74.5 KiB/token. So the head costs 12% of the KV allocation where the separate
+  drafter cost 90%, and that difference is the entire recipe. KDA state was 8.6
+  GB across 85 slots. Throughput against DSpark is a wash and the pool is the
+  win: generating, this arm gives 50.2 / 71.4 / 82.7 / 93.7 tok/s at
+  concurrency 1/2/4/8 with an empty prefix against DSpark's 61.3 / 71.4 / 74.9 /
+  95.5, and 37.0 / 53.7 / 55.9 / 41.0 at 16384 tokens of depth against 44.0 /
+  48.0 / 42.1 / 39.7. Prefill is where it pulls clear at load, 3356.9 tok/s at
+  depth 0 and concurrency 8 against DSpark's 1690.1, because that arm was
+  prefill-starved by its own draft cache. Draft acceptance ran 31-43% at a mean
+  acceptance length of 1.93-2.28, against DSpark's 13-19% at 2.05-2.52. Note
+  --speculative-algorithm NEXTN resolves internally to EAGLE with
+  speculative_num_steps 3, eagle_topk 1 and num_draft_tokens 4, so this is k=3
+  and directly comparable to the vLLM sibling's speculative_config depth.
+  The comparison that decides which engine to run is against
+  ling-3.0-flash-fp4-vllm, measured the same day on the same profile, and it
+  splits cleanly. vLLM owns startup: InstantTensor reads the 65.5 GB checkpoint
+  in 12 s at 5.69 GB/s and reaches serving in about 160 s, where this recipe
+  spends 343.71 s on weights alone and 400.57 s end to end - a 28x difference on
+  load that SGLang has no answer to in this image. vLLM also holds a slightly
+  larger pool, 2432970 tokens at 9.28x. But SGLang owns everything after
+  startup, and at depth it is not close: at 16384 tokens this recipe generates
+  37.0 / 53.7 / 55.9 / 41.0 tok/s at concurrency 1/2/4/8 against vLLM's 14.8 /
+  14.5 / 14.5 / 11.7, a 2.5-3.9x gap, with prefill 1415.9 against 372.7 and
+  time to first response at concurrency 8 of 9216 ms against 31035 ms. vLLM's
+  decode also collapses with depth, 31.9 tok/s at concurrency 1 with an empty
+  prefix falling to 14.8 at 16384, where this recipe falls only 50.2 to 37.0.
+  That is a much wider engine gap than the +38% aggregate the
+  qwen3.8-27b-nvfp4-dflash2-sglang recipe measured on a dense 27B, and it points
+  the same way. For a box that serves continuously, paying 400 s once is the
+  right side of that trade; reach for the vLLM sibling when restart latency
+  matters more than sustained throughput.
+  Two caveats on every number above. The profile ran with runs 1, so individual
+  cells carry single-sample noise - the DSpark arm's 90.4 tok/s at depth 4096
+  and concurrency 2 is visibly not a real effect - and the shape of the curves
+  is trustworthy where any one cell is not. And vLLM's draft acceptance logged
+  38.3% and 28.6% on the day, against the 60.2% its own recipe recorded on
+  2026-08-18, because the eugr/spark-vllm:latest tag drifted from
+  0.27.2rc1.dev209+gf9f066d19 to 0.1.1.dev7+g8c1d1c297 in between. So some part
+  of vLLM's deficit here may belong to that build rather than to the engine, and
+  the comparison is worth repeating when the tag next moves. What did survive
+  the drift is the pool: 2432970 tokens against the 2438110 the August run
+  recorded, which is the same number.
+  The speculative flags are deliberately minimal - just the algorithm, as
+  upstream writes it - rather than the tuned set the DSpark sibling needs. Two
+  that are absent on purpose: --speculative-num-draft-tokens, because the DSpark
+  arm's gamma+1 rule is a DSpark rule and NEXTN carries its own defaults, and
+  --enable-linear-replayssm-spec with --linear-replayssm-cache-len, because that
+  pair was validated for the DSpark draft's 8-token block and folding KDA
+  intermediates onto a fixed ring has not been checked against this head. Add
+  them only with a measurement. Note one consequence of leaving the replay-SSM
+  flag off: --mamba-ssm-dtype is not forced to float32 here, so unlike the
+  DSpark sibling it is a free knob, worth roughly half of the 6.7 GB of KDA
+  state that arm allocated across 91 slots.
+  Everything else is inherited from ling-3.0-flash-fp4-sglang, including the two
+  values that each cost a failed launch on the DSpark arm to learn -
+  --moe-runner-backend flashinfer_mxfp4, without which the MXFP4 experts reach
+  the FP8 Triton runner and assert on packed weights, and --attention-backend
+  flashinfer per SGLang's SM120/SM121 guidance. Read that sibling for the
+  checkpoint choice, the earlyoom reason behind mem-fraction-static 0.80, and
+  the two unresolved warnings this checkpoint emits about rope_scaling and the
+  tokenizer backend.
+model: inclusionAI/Ling-3.0-flash-fp4
+container: lmsysorg/sglang:dev-Ling-3.0-flash
+mods: []
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  max_model_len: 262144
+  mem_fraction_static: 0.80
+  chunked_prefill_size: 2048
+  max_running_requests: 8
+  moe_runner_backend: flashinfer_mxfp4
+  served_model_name: ling-3.0-flash
+env:
+  CUTE_DSL_ARCH: sm_121a
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+  SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: '1'
+command: |
+  sglang serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tp-size {tensor_parallel} \
+    --trust-remote-code \
+    --context-length {max_model_len} \
+    --mem-fraction-static {mem_fraction_static} \
+    --chunked-prefill-size {chunked_prefill_size} \
+    --attention-backend flashinfer \
+    --max-running-requests {max_running_requests} \
+    --moe-runner-backend {moe_runner_backend} \
+    --reasoning-parser ling3 \
+    --speculative-algorithm NEXTN \
+    --tool-call-parser ling3
+recipe_version: "2"
+name: Ling-3.0-flash-FP4-MTP-SGLang-DGX-Spark
+cluster_only: false
+solo_only: false

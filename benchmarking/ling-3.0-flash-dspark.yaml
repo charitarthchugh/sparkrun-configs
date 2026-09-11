@@ -1,0 +1,34 @@
+framework: llama-benchy
+
+metadata:
+  description: |
+    Performance profile for the Ling-3.0-flash recipes on a single DGX Spark,
+    sized to the KV pool those recipes actually get rather than to a standard
+    ladder. The DSpark recipe boots with max_total_num_tokens=150131, because
+    the DSpark drafter is 5 layers of plain MHA at 32 KV heads and costs
+    74.5 KiB/token against the MLA target's 7.35 - ten times the model it
+    drafts for - so the draft cache takes 11.46 GB of the 12.6 GB allocated.
+    Every cell here stays inside that pool: the deepest x widest cell is
+    16384 x 8 = 131072 tokens, which leaves headroom. This is why the stock
+    profiles do not fit - spark-arena-v2 asks for 100000 x 5 = 500k tokens and
+    blog-qwen3.8-27b-dbsci for 32768 x 10 = 328k, and both would spend the run
+    queueing rather than measuring. Re-size this profile if the pool changes,
+    which it will if speculation is turned off: without the draft cache the
+    same budget holds well over a million tokens and the arena ladder fits.
+    One caveat on the numbers this produces: sglang rejects return_token_ids on
+    streaming requests, so llama-benchy interpolates token arrival times.
+    Totals stay exact because they come from the stream's usage block, but the
+    throughput timeseries is smoothed, which understates burstiness under
+    speculative decoding - exactly the thing DSpark changes. Treat per-cell
+    aggregate tok/s as sound and the timeseries shape as indicative.
+  maintainer: "@charitarth"
+
+category: performance
+
+args:
+  depth: [ 0, 4096, 16384 ]
+  pp: [ 2048 ]
+  tg: [ 128 ]
+  concurrency: [ 1, 2, 4, 8 ]
+  prefix_caching: true
+  runs: 1
