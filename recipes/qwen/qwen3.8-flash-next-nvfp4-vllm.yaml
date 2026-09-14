@@ -1,0 +1,156 @@
+description: >-
+  Qwen3.8-Flash-Next (125B total, 6B active, plus a 51B n-gram embedding table
+  and a 4B MTP head) on a single DGX Spark, serving the full native
+  262144-token context with fp8 KV, prefix caching and the MTP head at k=3.
+  This is eugr's @eugr/qwen3.8-flash-next-nvfp4-solo recipe with one addition,
+  the executor_config block below, which is the reason this copy exists at
+  all. The eugr recipe sets VLLM_PLE_TABLE_MEMORY=disk, which keeps the n-gram
+  table on NVMe and has b12x's PLE reader fetch rows with io_uring. Docker's
+  default seccomp profile blocks io_uring_setup (Docker 25+), so under stock
+  sparkrun the engine dies while constructing the model with "io_uring
+  initialization failed: Operation not permitted; enable io_uring in the
+  kernel/container policy". The host was never the problem —
+  kernel.io_uring_disabled is 0 — and the same image run with
+  seccomp=unconfined gets a valid ring, so the fix is purely container policy.
+  sparkrun already does exactly this for its atlas runtime, but not for vLLM.
+  security_opt replaces sparkrun's rootless default list rather than merging
+  with it, so no-new-privileges and label=disable are re-listed to keep that
+  hardening; cap_add is not touched, so the runtime's SYS_PTRACE default
+  survives. seccomp=unconfined drops the whole syscall filter, not just the
+  io_uring block; a custom profile that adds only io_uring_setup,
+  io_uring_enter and io_uring_register to Docker's default would be narrower
+  but means keeping a JSON file on the host. sparkrun trust-gates
+  security_opt, so it is honoured only when this recipe is trusted — run it by
+  file path (local recipes are trusted) or from a registry marked trusted;
+  from an untrusted registry the launch is refused rather than silently
+  running without io_uring. The checkpoint is local-inference-lab's
+  Qwen3.8-Flash-Next-NVFP4, a ModelOpt MIXED_PRECISION quant, which is why
+  --quantization is modelopt_mixed. NVFP4 W4A4 (group 16) covers the 48 routed-
+  expert blocks; MXFP8 (group 32) covers the Gated DeltaNet and QSA
+  projections, the shared experts and most of the vision tower; the MTP
+  head's routed experts and the vision fc2 layers are NVFP4 weight-only. On
+  disk it is 98.53 GiB, of which 26.88 GiB is the n-gram table — much smaller
+  than the 47.7 GiB table in RadixArk's checkpoint that
+  qwen3.8-flash-next-ple-mmap-vllm serves. Measured on this node 2026-09-12 on
+  vLLM 0.1.dev20610+g4b276a363 (local-inference-lab dev/jovian-judgement) in
+  the eugr b12x nightly of 2026-09-10. The b12x loader read the weights with
+  O_DIRECT in 34.99 s plus 1.56 s for the MTP head, and model loading came to
+  73.77 GiB resident in 71.8 s — against 79.31 GiB and a 642.9 s load for the
+  ple-mmap recipe. torch.compile took 43.14 s for the backbone and 16.03 s for
+  the MTP head, init engine 275.03 s, and launch to Application startup
+  complete about 6.5 minutes with a cold runtime cache. At
+  gpu_memory_utilization 0.8 the KV pool is 16.72 GiB, 1,057,294 tokens, 4.03x
+  concurrency at the full 262144 context (the ple-mmap recipe gets 771,621 at
+  2.94x in bf16), and the host kept 15-17 GiB available while serving, well
+  clear of this node's 2 GiB guard floor. Two things the ple-mmap recipe had
+  to give up work here. fp8 KV is accepted — that recipe's image refused it
+  with "QSA requires a BF16 main KV cache" — and prefix caching survived the
+  repeated identical 7,009-token prompt that tripped
+  CUBLAS_STATUS_INTERNAL_ERROR there, with the serve log clean afterwards.
+  Both are properties of this vLLM build, so re-check them if the image moves.
+  Qwen's official vLLM recipe also enables prefix caching and leaves the KV
+  dtype unstated. Throughput, bs1, temperature 0, thinking off, 800 max
+  tokens: a 30,065-token code prompt with no cache reuse reached first token
+  in 37.0 s (~812 tok/s prefill) then decoded at 32.0 tok/s with 68.5% MTP
+  acceptance and mean acceptance length 3.74, while a short prose prompt
+  decoded at 18.5 tok/s with acceptance collapsing to 28.1% (mean length
+  2.12). All of those figures were taken at k=4. Across an earlier code
+  session acceptance was 71.9%, per-position 0.91/0.77/0.65/0.55, so k=4 earns
+  its fourth slot on code only. On mixed traffic it does not: the live
+  counters from a 12-request serving session (366k prompt tokens, about 30k
+  per request, 12.2k generated) gave 40.0% acceptance and mean acceptance
+  length 2.60, with per-position rates of 0.658/0.441/0.296/0.207. The head
+  was right 66-70% of the time at every depth given the previous token was
+  accepted, so the low aggregate is compounding rather than a weak head, and
+  the fourth slot added only about 0.2 tokens per step while costing a full
+  draft slot in every verify pass. That is why the default is now k=3. It is
+  an inference from the acceptance counters, not a throughput measurement:
+  k=3 has not been benchmarked against k=4 on this node, and code-heavy
+  workloads may still prefer -o num_speculative_tokens=4. The prefill
+  figure is lower than the ple-mmap recipe's 1725 tok/s cold on a 47.6k
+  prompt; the prompts differ, so that is an observation, not a controlled
+  comparison. Tool calls use qwen3_xml, matching Qwen's official vLLM recipe,
+  and were verified emitting a parsed tool_calls entry with finish_reason
+  tool_calls; the qwen3 reasoning parser returns the trace in the message's
+  "reasoning" field. The checkpoint's generation_config.json sets temperature
+  1.0, top_p 0.95, top_k 20, which is Qwen's thinking-mode recommendation, so
+  a client sending no sampling parameters gets those; Qwen suggests 0.7 /
+  0.8 / 20 with presence_penalty 1.5 for non-thinking use. The model extends
+  to 1M via static YaRN, but Qwen advises enabling it only when long context
+  is actually needed, since the scaling applies to short requests too. Expect
+  sparkrun's VRAM estimate to warn that 98.6 GB of weights exceed usable
+  memory and leave 0 GB for KV — it counts the n-gram table that disk mode
+  keeps off the GPU. The build-parallelism caps are carried from the rest of
+  the registry rather than measured against this image, which otherwise sets
+  MAX_JOBS=16. The model is multimodal but no image request has been run
+  through this recipe, so that path is unexercised.
+model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4
+container: vllm-node-b12x
+build_args:
+  - --exp-b12x
+executor_config:
+  # b12x's disk PLE reader needs io_uring, which Docker's default seccomp
+  # profile blocks. This list replaces sparkrun's rootless default rather than
+  # merging with it, so the first two entries re-list that hardening.
+  security_opt:
+    - no-new-privileges
+    - label=disable
+    - seccomp=unconfined
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  pipeline_parallel: 1
+  block_size: 16
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_seqs: 8
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 3
+env:
+  # Keeps the 26.88 GiB n-gram table on NVMe; this is what needs io_uring.
+  VLLM_PLE_TABLE_MEMORY: disk
+  CUTE_DSL_ARCH: sm_121a
+  SAFETENSORS_FAST_GPU: '1'
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_USE_AOT_COMPILE: '1'
+  VLLM_USE_MEGA_AOT_ARTIFACT: '1'
+  VLLM_USE_V2_MODEL_RUNNER: '1'
+  B12X_POLICY_MODE: auto
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --mamba-cache-mode align \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --dtype bfloat16 \
+    --kv-cache-dtype fp8 \
+    --quantization modelopt_mixed \
+    --block-size {block_size} \
+    --load-format b12x \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+    --gdn-decode-kernel b12x \
+    --linear-backend b12x \
+    --moe-backend b12x \
+    --no-enable-flashinfer-autotune \
+    --mm-encoder-tp-mode data \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice \
+    --compilation-config '{{"pass_config":{{"fuse_act_quant":true}}}}' \
+    --gpu-memory-utilization {gpu_memory_utilization}
+recipe_version: "2"
+name: Qwen3.8-Flash-Next-NVFP4-b12x-DGX-Spark
+cluster_only: false
+solo_only: true
