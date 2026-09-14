@@ -1,0 +1,193 @@
+description: >-
+  Qwen3.8-Flash-Next — ~180B total, 6B active, plus a 51B n-gram embedding table
+  — on a single DGX Spark, serving the full native 262144-token context with the
+  checkpoint's MTP head at k=2. This is
+  https://github.com/blazux/qwen3.8-Flash-DGX ported to a sparkrun recipe:
+  upstream's Dockerfile becomes the ple-mmap-vllm mod, and its scripts/serve.sh
+  becomes the command block below. Measured on this node 2026-08-29 on vLLM
+  0.1.dev20073+g8e685d198 in the digest-pinned image; upstream's own figures
+  come from an ASUS GX10 and @jschmied's reproduction from another Spark, and
+  they are quoted below only where the comparison is the point. The problem the
+  recipe exists to solve is memory. RadixArk's NVFP4 checkpoint is ~126 GiB on
+  disk and a Spark has 128 GB of unified memory, so weights alone leave nothing
+  for KV — you simply cannot serve it. 47.7 GiB of that is the n-gram ("PLE")
+  table, which is a pure lookup: a token reads 16 rows x 160 bytes, about 2.5
+  KB, at hashed addresses, so a 20k-token prefill is ~1.3 GB of small reads and
+  the hot n-grams stay in the page cache. The ple-mmap-vllm mod serves that
+  table from NVMe via mmap instead of keeping it resident. On this node that is
+  128 shards, 320,001,536 rows x 160 B of F8_E4M3 left on disk and gathered by
+  32 worker threads, and it brings the model down to 79.31 GiB resident, leaving
+  a 771,621-token KV pool at 2.94x concurrency for full-length requests.
+  Upstream predicted ~76 GiB and a 720-790k pool at ~3x, so the mechanism
+  transfers to this box essentially unchanged. vLLM's own VLLM_PLE_CPU_OFFLOAD=1
+  does not help here: it moves the table to pinned host RAM, which is the same
+  physical pool on a Spark. Read the mod's README before changing anything in
+  this recipe — several of its settings are load-bearing for the mmap path and
+  look like mistakes without that context. Throughput, bs1 at 800 max tokens,
+  two runs each: 30.1 and 29.2 tok/s on a code prompt with thinking off, 21.9
+  and 23.6 on discursive prose, and 22.8/24.3 (code) and 22.4/22.1 (prose) with
+  thinking on. MTP acceptance over that session was 62.5% — 3216 accepted of
+  5144 drafted, mean acceptance length 2.25, 73% at the first draft position and
+  52% at the second — which lands on the ~63% upstream reports. Prefill on a
+  47,623-token prompt ran 1725 tok/s cold and 2298 tok/s warm; the 33%
+  cold-to-warm gap is the page cache filling with the n-gram rows the prompt
+  touches, and it is the clearest direct evidence the table is genuinely being
+  served from disk. Set VLLM_PLE_MMAP_PREWARM=1 to pay that once at boot (~10 s)
+  instead of on the first requests. The comparison that matters is against the
+  llama.cpp IQ4_XS GGUF, which until this recipe was the only thing that ran
+  Flash-Next on a Spark at all: ~540 tok/s prefill and ~22 tok/s decode with no
+  MTP available. Prefill is the headline, and the reason is architectural —
+  Flash-Next's whole point is Qwen Sparse Attention, llama.cpp has no QSA kernel
+  and runs dense, so prefill is exactly where the GGUF is weakest. Concurrency
+  is the other axis, and it scales: 512-token completions gave 24.4 tok/s
+  aggregate at 1 stream, 60.9 at 4, and 97.9 at 8 (12.2 per stream). @jschmied
+  saw the same shape without speculation on their Spark — 17.1 at c=1 rising to
+  87.5 at c=8 and ~267 at 48 — with page-fault cost per token *falling* 4.4x
+  from c=1 to c=48, because batched tokens share n-gram rows and the page cache
+  keeps the hot set. The paged table is an argument for concurrency, not against
+  it. max_num_seqs is 8 for a specific reason: at 1-2 the excess requests queue
+  silently and aggregate tok/s flatlines at ~33 while request_queue_time climbs
+  into the hundreds of seconds, which is indistinguishable from saturation if
+  you only watch tok/s. Now the three inversions of house convention, none of
+  which are oversights. --kv-cache-dtype is auto (bf16), not the fp8 this
+  registry uses everywhere else, because the QSA layers refuse it outright with
+  "Qwen3.8-Flash-Next QSA requires a BF16 main KV cache" — the halve-the-KV
+  lever does not exist on this model. --no-enable-prefix-caching, not the usual
+  --enable-prefix-caching, because a GDN in_proj GEMM hits
+  CUBLAS_STATUS_INTERNAL_ERROR on the cached-block path on sm_121; the second
+  identical prompt is what trips it. And full torch.compile is off in favour of
+  -cc.cudagraph_mode=PIECEWISE with an explicit splitting-ops list, both because
+  an Inductor int64-indexing assert fires in the embedding gather codegen on
+  sm_121 and because the mmap gather is CPU work plus a pageable host-to-device
+  copy that cannot live inside a captured CUDA graph — hence
+  vllm::ple_mmap_lookup in that list. Capture came up clean here, 9 decode and 9
+  prefill graphs in 13 s. --async-scheduling is deliberately absent: the
+  max-throughput text profile this registry uses elsewhere was never validated
+  against the mmap path, and importing it here would be a guess. The model
+  argument is a resolved snapshot directory rather than the Hub repo id, which
+  is the other thing that looks odd and is not: the mmap module globs the
+  checkpoint's model-plefp8-*.safetensors shards itself and raises on a bare
+  repo id. sparkrun downloads to the cache it mounts at /cache/huggingface, so
+  snapshot_download resolves offline inside the container; the && is there so a
+  missing snapshot fails with huggingface_hub's error rather than handing vLLM
+  an empty argument. The image's ENTRYPOINT is ["vllm","serve"], so
+  executor_config clears it — this recipe runs the server from its own command
+  block, and left in place the image parses sparkrun's launcher as its own flags
+  and nothing starts. gpu_memory_utilization is 0.85 and should stay there. That
+  leaves real headroom here — 80.32 GiB consumed plus 1.78 GiB peak activation
+  and 21.33 GiB of KV against 121.69 GiB total — and vLLM will offer to raise KV
+  to 29.03 GiB to "fully utilize" the budget. Do not take it: upstream got
+  OOM-killed at 0.875 on a 300k-token prefill with MTP, the activation peak at
+  full length is far above the 1.78 GiB seen at these lengths, and on a Spark
+  the OS shares this pool, so an OOM can take the box down rather than just the
+  workload. Tool calls use qwen3_xml, matching both the official vLLM recipe for
+  this model and the rest of this registry; upstream's serve.sh uses
+  qwen3_coder, which reads the same <tool_call>/<function= template, so either
+  works. Verified here emitting a correctly parsed tool_calls entry. The qwen3
+  reasoning parser works too, but note that this vLLM build returns the trace in
+  the message's "reasoning" field, not the older "reasoning_content" — a client
+  reading only the latter sees an empty trace while
+  completion_tokens_details.reasoning_tokens is non-zero. vLLM logs at startup
+  that generation_config.json overrides its sampling defaults to temperature
+  1.0, top_p 0.95, top_k 20 — Qwen's thinking-mode recommendation — so a client
+  that sends no sampling parameters gets those rather than vLLM's; pass
+  --generation-config vllm if that is not wanted. Loading is slow: 642.9 s here,
+  a little over upstream's ~8 minutes, split into a 528.7 s main pass and an
+  88.7 s second pass. The checkpoint is multimodal (image and video) and no
+  --limit-mm-per-prompt or --mm-processor-kwargs caps are set, following
+  upstream; multi-modal warmup completed clean at startup, but no image-grounded
+  request has been run through this recipe, so that path is unexercised. The
+  model extends to 1M via static YaRN but this recipe stays at the native
+  262144, and 1M is out of reach on one box anyway: with fp8 KV refused, a
+  single 1M request needs ~30 GiB of KV in bf16. 500k is upstream's validated
+  ceiling, with a needle found at 414k. To get there, add Qwen's published rope
+  override through --hf-overrides ({"text_config": {"rope_parameters":
+  {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type":
+  "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0,
+  "original_max_position_embeddings": 262144}}}), set
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN=1, and raise max_model_len — and note the trap:
+  dict hf_overrides are not propagated to the draft model, so the draft keeps
+  max_model_len 262144 while sharing a cache_config sized to the target and the
+  engine aborts with "--mamba-block-size can only be set with
+  --enable-prefix-caching". The fix is putting "max_model_len" inside
+  speculative_config too. 800k booted for upstream but got OOM-killed on a long
+  prefill. Quantization is NVFP4 W4A4 (group 16, FP8 E4M3 block scales) on the
+  routed experts of the 48 MoE layers only; attention, QSA, GDN, gated residual,
+  shared experts, routers, embeddings, lm_head, the vision tower and all 31 MTP
+  tensors stay BF16 and byte-identical to the source, and the PLE tables are the
+  FP8 shards from Qwen's own FP8 revision. --quantization is omitted so vLLM
+  autodetects it, and the logs confirm quantization=modelopt_fp4. Expect
+  sparkrun's own VRAM estimate to report "DGX Spark fit: EXCEEDS 121 GB" and 0.0
+  GB available for KV — that reads the 125.9 GB checkpoint off the Hub and has
+  no way to know the mod moves 47.7 GiB of it to disk. The warning is correct
+  about the unmodded checkpoint and is exactly the problem this recipe solves.
+  One box, one model: at 0.85 this uses most of the pool, and co-locating
+  anything else large starves the KV cache.
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+container: vllm/vllm-openai:qwen38-flash-next@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8
+mods:
+  - "@charitarth/ple-mmap-vllm"
+executor_config:
+  # The image's ENTRYPOINT is ["vllm","serve"] — upstream's serve.sh passes only
+  # the snapshot path and flags, so the image runs the server itself. This recipe
+  # runs `vllm serve` from its own command block, so the entrypoint has to be
+  # cleared; leave it in place and the image parses sparkrun's launcher as its
+  # own flags and the workload never starts.
+  entrypoint: ""
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+  max_num_seqs: 8
+  served_model_name: qwen3.8-flash-next
+  speculative_config: '{"method":"mtp","num_speculative_tokens":2}'
+  # vllm::ple_mmap_lookup is the mod's custom op and is the reason this list is
+  # spelled out at all; the rest are the stock Flash-Next attention ops that
+  # PIECEWISE capture already splits on and that must be repeated when the flag
+  # is set explicitly.
+  splitting_ops: '["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]'
+env:
+  # Without this the mod's hook is inert and the engine materialises the 47.7 GiB
+  # n-gram table, which does not fit next to the rest of the weights.
+  VLLM_PLE_MMAP: '1'
+  VLLM_PLE_MMAP_WORKERS: '32'
+  # 1 streams the table once at boot (~10 s) to warm the page cache.
+  VLLM_PLE_MMAP_PREWARM: '0'
+  VLLM_USE_FLASHINFER_SAMPLER: '1'
+  # Spark-specific build-parallelism caps, carried from the rest of the registry
+  # rather than measured against this image: on-node compiles are what OOM a box
+  # this memory-tight, and the caps cost nothing when nothing compiles.
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+command: |
+  MODEL_DIR="$(python3 -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], local_files_only=True))' {model})" && \
+  vllm serve "$MODEL_DIR" \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tensor-parallel-size {tensor_parallel} \
+    --load-format safetensors \
+    --kv-cache-dtype auto \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --no-enable-flashinfer-autotune \
+    -cc.cudagraph_mode=PIECEWISE \
+    -cc.splitting_ops='{splitting_ops}' \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --speculative-config '{speculative_config}'
+recipe_version: "2"
+name: Qwen3.8-Flash-Next-NVFP4-PLE-mmap-DGX-Spark
+cluster_only: false
+solo_only: true
