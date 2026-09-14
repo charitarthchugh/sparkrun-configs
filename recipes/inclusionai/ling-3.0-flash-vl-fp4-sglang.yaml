@@ -1,0 +1,111 @@
+description: >-
+  Ling-3.0-flash-VL - 124B total, 5.5B active, the multimodal sibling of
+  Ling-3.0-flash - served with SGLang on a single DGX Spark. Same 42-layer
+  hybrid backbone, 35 Kimi Delta Attention layers alternating 5:1 with 7 Gated
+  MLA, plus a 27-block ViT encoder and a two-layer MLP projector, with VideoRoPE
+  for temporal order so video input works as well as images. NOT MEASURED - this
+  recipe is written from the checkpoint and the upstream card, and inherits its
+  two load-bearing flags from ling-3.0-flash-fp4-mtp-sglang, where each cost a
+  failed launch to find. Boot it and fill in the numbers before trusting it.
+  Three differences from the text recipe matter more than the vision tower does.
+  First, there is no speculation here and there cannot be: the VL config
+  declares num_nextn_predict_layers null, and the weight map confirms it -
+  layer ids stop at 41, so the NextN/MTP head that the text checkpoint carries
+  at layer 42 is simply absent. Do not copy --speculative-algorithm NEXTN across
+  from the sibling; it has nothing to load. That also means the ~2 GB of MTP
+  draft cache the text recipe pays for is not spent here, so the KV pool should
+  come out slightly larger than that recipe's, all else equal.
+  Second, the native context is 131072, not the 262144 the text model has. The
+  262144 in this recipe is reached with static YaRN, exactly as upstream's own
+  launch command does it - rope_type yarn at factor 2.0 over an original 131072,
+  keeping rope_theta 6000000 and partial_rotary_factor 0.5. The override lives
+  in defaults as rope_override rather than inline, because sparkrun substitutes
+  {name} placeholders and a bare JSON object in the command block collides with
+  that. Be aware of the trade this registry usually declines: static YaRN
+  applies the scaling to every request, short ones included, which is the reason
+  qwen3.8-27b-nvfp4-vllm deliberately leaves it off. It is on here because the
+  vendor ships it as the default recipe rather than as an opt-in, and because
+  131072 would otherwise put this below the window the rest of this registry
+  holds. Drop the two rope lines and set max_model_len to 131072 to run native.
+  Third, the vision tower is unquantized and the quantization config says so -
+  model.visual and linear_proj are both in modules_to_not_convert, alongside the
+  q/kv projections, lm_head, word_embeddings and the attention g_proj layers.
+  Everything else is the same mixed layout as the text checkpoint: quant_method
+  fp8 with weight_block_size 128x128 for the dense path, and
+  routed_experts_quant_method mxfp4 at group size 32 with e8m0 scales for the
+  512 routed experts. That is why --moe-runner-backend flashinfer_mxfp4 is
+  pinned here too. Left at auto on the text sibling the engine detected the
+  layout correctly, logged "Detected mixed checkpoint layout: routed experts are
+  MXFP4", and then sent the experts to the FP8 quant method with the Triton MoE
+  runner anyway, dying with "AssertionError: Hidden size mismatch" because
+  MXFP4-packed weights are half the width that kernel expects. --attention-backend
+  flashinfer follows SGLang's SM120/SM121 guidance, trtllm_mha being SM100-only.
+  The container is the model-specific tag, which does publish a linux/arm64
+  variant - checked, 13.5 GiB, pushed 2026-09-09, which is three weeks newer
+  than the text model's tag. Weights are 64.8 GiB across 64 shards, marginally
+  smaller than the text checkpoint's 65.5 GiB despite carrying a ViT, because
+  the VL build has no MTP head. Expect weight loading to dominate startup the
+  way it does on the sibling, which spent 343.71 s there and 400.57 s end to
+  end; SGLang has no InstantTensor equivalent in this image, and the vLLM
+  sibling reads the same class of checkpoint in 12 s by comparison.
+  Sampling defaults come from generation_config.json - temperature 1.0, top_p
+  0.95, top_k 20 - and note the card's own prose says 0.6 in one paragraph and
+  1.0 in another, with 1.0 being the one the config file actually ships.
+  Thinking is on by default from the chat template; disable per request with
+  chat_template_kwargs {"enable_thinking": false}. Parsers are set explicitly to
+  ling3 rather than left at upstream's "auto", which resolves to the same thing
+  from the chat template - explicit matches house convention and fails loudly if
+  the template ever changes.
+  Unverified and worth checking first, in this order. Whether the fp4 VL build
+  loads at all on sm_121, since the vision tower and projector take a different
+  path from anything measured here. Whether image input works end to end - the
+  ViT declares num_position_embeddings 2304 at patch size 16 with spatial merge
+  2, the same budget that makes qwen3.8-27b-nvfp4-vllm cap images via
+  mm_processor_kwargs, so a large enough image may fail the request rather than
+  being downscaled; SGLang's equivalent knob is --limit-mm-data-per-request and
+  it is deliberately not set until someone establishes what the real ceiling is.
+  Whether video input works, which nothing in this registry has ever exercised.
+  And whether the YaRN override actually holds at length - a needle retrieval
+  near 200000 tokens is the check, and it is the one result that would justify
+  the 262144 in this file.
+model: inclusionAI/Ling-3.0-flash-VL-fp4
+container: lmsysorg/sglang:dev-Ling-3.0-flash-VL
+mods: []
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  max_model_len: 262144
+  mem_fraction_static: 0.80
+  chunked_prefill_size: 2048
+  max_running_requests: 8
+  moe_runner_backend: flashinfer_mxfp4
+  served_model_name: ling-3.0-flash-vl
+  rope_override: '{"rope_scaling":{"rope_type":"yarn","factor":2.0,"rope_theta":6000000,"partial_rotary_factor":0.5,"original_max_position_embeddings":131072}}'
+env:
+  CUTE_DSL_ARCH: sm_121a
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+  SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: '1'
+command: |
+  sglang serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tp-size {tensor_parallel} \
+    --trust-remote-code \
+    --context-length {max_model_len} \
+    --json-model-override-args '{rope_override}' \
+    --mem-fraction-static {mem_fraction_static} \
+    --chunked-prefill-size {chunked_prefill_size} \
+    --attention-backend flashinfer \
+    --max-running-requests {max_running_requests} \
+    --moe-runner-backend {moe_runner_backend} \
+    --reasoning-parser ling3 \
+    --tool-call-parser ling3
+recipe_version: "2"
+name: Ling-3.0-flash-VL-FP4-SGLang-DGX-Spark
+cluster_only: false
+solo_only: false
