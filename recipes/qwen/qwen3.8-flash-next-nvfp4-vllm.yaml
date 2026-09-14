@@ -107,6 +107,7 @@ defaults:
   max_num_seqs: 8
   max_num_batched_tokens: 4096
   num_speculative_tokens: 3
+  served_model_name: qwen3.8-flash-next
 env:
   # Keeps the 26.88 GiB n-gram table on NVMe; this is what needs io_uring.
   VLLM_PLE_TABLE_MEMORY: disk
@@ -125,6 +126,7 @@ command: |
   vllm serve {model} \
     --host {host} \
     --port {port} \
+    --served-model-name {served_model_name} \
     --trust-remote-code \
     --tensor-parallel-size {tensor_parallel} \
     --pipeline-parallel-size {pipeline_parallel} \

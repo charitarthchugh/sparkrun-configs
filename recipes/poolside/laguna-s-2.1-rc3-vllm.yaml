@@ -170,7 +170,7 @@ defaults:
   draft_revision: b3b5921a900b9e0a1e27e50bdaeb480692a6d19b
   num_speculative_tokens: 3
   max_model_len: 262144
-  served_model_name: laguna-s-2.1-nvfp4-rc3
+  served_model_name: laguna-s-2.1-nvfp4
   max_num_batched_tokens: 2048
   max_num_seqs: 1
 
@@ -204,6 +204,7 @@ command: |
     --revision {revision} \
     --code-revision {revision} \
     --tokenizer-revision {revision} \
+    --served-model-name {served_model_name} \
     --trust-remote-code \
     --dtype auto \
     --load-format instanttensor \
