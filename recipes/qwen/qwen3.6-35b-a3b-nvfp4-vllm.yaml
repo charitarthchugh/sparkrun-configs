@@ -1,5 +1,10 @@
-recipe_version: "1"
-name: Qwen36-35B-A3B-NVFP4-nvidia
+recipe_version: "2"
+model: nvidia/Qwen3.6-35B-A3B-NVFP4
+runtime: vllm-distributed
+builder: eugr
+min_nodes: 1
+max_nodes: 1
+container: eugr/spark-vllm:latest
 description: >-
   vLLM serving nvidia/Qwen3.6-35B-A3B-NVFP4 with --load-format instanttensor.
   container is set to eugr/spark-vllm:latest rather than the locally-built
@@ -12,7 +17,13 @@ description: >-
   IDs, confirmed against the container named for this job. The nemotron-omni
   recipe launches on exactly the image it names, so the substitution is specific
   to this recipe, which is also the only one where sparkrun runs a Building step
-  instead of skipping it. No image mapping was found in ~/.config/sparkrun/. The
+  instead of skipping it. The cause is the eugr builder, not an image mapping:
+  as a recipe_version 1 file this recipe had builder: eugr inferred on load, and
+  that builder substitutes its GHCR nightly for eugr/spark-vllm:latest, while
+  the v2 siblings naming the same container get no builder. The recipe is now v2
+  with builder: eugr declared explicitly, so it keeps launching the image all
+  the numbers below were measured on; delete that line to run on
+  eugr/spark-vllm:latest like its siblings, and re-measure if you do. The
   test below therefore describes the nightly image; it happens to ship
   instanttensor too, which is why the loader worked at all.
 
@@ -35,11 +46,16 @@ description: >-
   directory at /cache/runtime and points VLLM_CACHE_ROOT,
   TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR and XDG_CACHE_HOME into it, so this
   recipe sets none of those paths itself — a path in env wins over the managed
-  one and would escape the keyed, pruned tree. The single addition is
-  FLASHINFER_WORKSPACE_BASE, because FlashInfer 0.6.18 reads only that variable
-  and derives its own cache dir internally, leaving sparkrun's
-  FLASHINFER_CACHE_DIR export inert; without it the JIT-compiled kernels sit in
-  /tmp and die with the --rm container. This recipe is the cleanest case of the
+  one and would escape the keyed, pruned tree. FLASHINFER_WORKSPACE_BASE used to
+  be the single addition, set by hand to /cache/runtime/flashinfer-home because
+  FlashInfer 0.6.18 reads only that variable and sparkrun 0.3.5's
+  FLASHINFER_CACHE_DIR export was inert. sparkrun 0.3.10 sets
+  FLASHINFER_WORKSPACE_BASE into the runtime-cache mount itself, and a recipe
+  value would override it (recipe validate reports that as managed-cache-env),
+  so this recipe no longer sets it. The managed directory is not the old
+  hand-set one, so the first launch after that change recompiles FlashInfer's
+  small JIT cache once; any launch timings recorded here were taken with the
+  hand-set path. This recipe is the cleanest case of the
   four measured on 2026-08-18. Three consecutive launches, the first with the
   runtime-cache tree deleted, gave wall clock to Application startup complete of
   279 s, 156 s and 157 s, with init engine 134.92 s (44.84 s compilation), then
@@ -52,9 +68,6 @@ description: >-
   1.7 MB of FlashInfer JIT objects. The first two launches each served a chat
   completion; the third was verified only as far as Application startup
   complete.
-model: nvidia/Qwen3.6-35B-A3B-NVFP4
-container: eugr/spark-vllm:latest
-cluster_only: false
 
 defaults:
   port: 8000
@@ -62,25 +75,22 @@ defaults:
   tensor_parallel: 1
   gpu_memory_utilization: 0.65
   max_model_len: 262144
+  kv_cache_dtype: fp8
   max_num_batched_tokens: 32768
   max_num_seqs: 4
   served_model_name: qwen3.6-35b-a3b
 
 env:
   VLLM_MARLIN_USE_ATOMIC_ADD: "1"
-  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
-  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
-  # compiled kernels land in /tmp and die with the --rm container.
-  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
 
 command: |
-  vllm serve nvidia/Qwen3.6-35B-A3B-NVFP4 \
+  vllm serve {model} \
     --host {host} \
     --port {port} \
     --served-model-name {served_model_name} \
     --tensor-parallel-size {tensor_parallel} \
     --trust-remote-code \
-    --kv-cache-dtype fp8 \
+    --kv-cache-dtype {kv_cache_dtype} \
     --attention-backend flashinfer \
     --moe-backend marlin \
     --gpu-memory-utilization {gpu_memory_utilization} \

@@ -1,3 +1,9 @@
+recipe_version: "2"
+model: RadixArk/Qwen3.8-27B-NVFP4
+runtime: sglang
+min_nodes: 1
+max_nodes: 1
+container: lmsysorg/sglang:dev-qwen38-27b-dflash2
 description: >-
   The qwen3.8-27b-nvfp4-dflash2-sglang recipe with the DFlash2 drafter swapped
   for the checkpoint's own MTP head, and nothing else changed - same RadixArk
@@ -30,8 +36,6 @@ description: >-
   sent, the parsers were not exercised against a real tool-calling harness, and
   no output-quality comparison was made. Same dev-tag caveat too -
   lmsysorg/sglang:dev-qwen38-27b-dflash2 at sglang 0.0.0.dev1+g5f55db35e.
-model: RadixArk/Qwen3.8-27B-NVFP4
-container: lmsysorg/sglang:dev-qwen38-27b-dflash2
 mods: []
 defaults:
   port: 8000
@@ -75,7 +79,3 @@ command: |
     --speculative-num-draft-tokens {speculative_num_draft_tokens} \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder
-recipe_version: "2"
-name: Qwen3.8-27B-NVFP4-MTP-SGLang-DGX-Spark
-cluster_only: false
-solo_only: false

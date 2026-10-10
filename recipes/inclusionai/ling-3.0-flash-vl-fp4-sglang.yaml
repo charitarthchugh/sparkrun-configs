@@ -1,3 +1,9 @@
+recipe_version: "2"
+model: inclusionAI/Ling-3.0-flash-VL-fp4
+runtime: sglang
+min_nodes: 1
+max_nodes: 1
+container: lmsysorg/sglang:dev-Ling-3.0-flash-VL
 description: >-
   Ling-3.0-flash-VL - 124B total, 5.5B active, the multimodal sibling of
   Ling-3.0-flash - served with SGLang on a single DGX Spark. Same 42-layer
@@ -68,8 +74,6 @@ description: >-
   And whether the YaRN override actually holds at length - a needle retrieval
   near 200000 tokens is the check, and it is the one result that would justify
   the 262144 in this file.
-model: inclusionAI/Ling-3.0-flash-VL-fp4
-container: lmsysorg/sglang:dev-Ling-3.0-flash-VL
 mods: []
 defaults:
   port: 8000
@@ -105,7 +109,3 @@ command: |
     --moe-runner-backend {moe_runner_backend} \
     --reasoning-parser ling3 \
     --tool-call-parser ling3
-recipe_version: "2"
-name: Ling-3.0-flash-VL-FP4-SGLang-DGX-Spark
-cluster_only: false
-solo_only: false

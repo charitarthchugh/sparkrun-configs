@@ -1,3 +1,10 @@
+recipe_version: "2"
+model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4
+runtime: vllm-distributed
+builder: eugr
+min_nodes: 1
+max_nodes: 1
+container: vllm-node-b12x
 description: >-
   Qwen3.8-Flash-Next (125B total, 6B active, plus a 51B n-gram embedding table
   and a 4B MTP head) on a single DGX Spark, serving the full native
@@ -84,8 +91,6 @@ description: >-
   the registry rather than measured against this image, which otherwise sets
   MAX_JOBS=16. The model is multimodal but no image request has been run
   through this recipe, so that path is unexercised.
-model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4
-container: vllm-node-b12x
 build_args:
   - --exp-b12x
 executor_config:
@@ -104,6 +109,7 @@ defaults:
   block_size: 16
   gpu_memory_utilization: 0.8
   max_model_len: 262144
+  kv_cache_dtype: fp8
   max_num_seqs: 8
   max_num_batched_tokens: 4096
   num_speculative_tokens: 3
@@ -134,14 +140,14 @@ command: |
     --enable-prefix-caching \
     --enable-chunked-prefill \
     --dtype bfloat16 \
-    --kv-cache-dtype fp8 \
+    --kv-cache-dtype {kv_cache_dtype} \
     --quantization modelopt_mixed \
     --block-size {block_size} \
     --load-format b12x \
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \
     --max-num-batched-tokens {max_num_batched_tokens} \
-    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}' \
     --gdn-decode-kernel b12x \
     --linear-backend b12x \
     --moe-backend b12x \
@@ -150,9 +156,5 @@ command: |
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_xml \
     --enable-auto-tool-choice \
-    --compilation-config '{{"pass_config":{{"fuse_act_quant":true}}}}' \
+    --compilation-config '{"pass_config":{"fuse_act_quant":true}}' \
     --gpu-memory-utilization {gpu_memory_utilization}
-recipe_version: "2"
-name: Qwen3.8-Flash-Next-NVFP4-b12x-DGX-Spark
-cluster_only: false
-solo_only: true

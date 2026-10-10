@@ -1,3 +1,9 @@
+recipe_version: "2"
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: vllm/vllm-openai:qwen38-flash-next@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8
 description: >-
   Qwen3.8-Flash-Next — ~180B total, 6B active, plus a 51B n-gram embedding table
   — on a single DGX Spark, serving the full native 262144-token context with the
@@ -123,8 +129,6 @@ description: >-
   about the unmodded checkpoint and is exactly the problem this recipe solves.
   One box, one model: at 0.85 this uses most of the pool, and co-locating
   anything else large starves the KV cache.
-model: RadixArk/Qwen3.8-Flash-Next-NVFP4
-container: vllm/vllm-openai:qwen38-flash-next@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8
 mods:
   - "@charitarth/ple-mmap-vllm"
 executor_config:
@@ -187,7 +191,3 @@ command: |
     --tool-call-parser qwen3_xml \
     --reasoning-parser qwen3 \
     --speculative-config '{speculative_config}'
-recipe_version: "2"
-name: Qwen3.8-Flash-Next-NVFP4-PLE-mmap-DGX-Spark
-cluster_only: false
-solo_only: true

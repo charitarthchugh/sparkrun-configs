@@ -115,11 +115,16 @@ metadata:
     directory at /cache/runtime and points VLLM_CACHE_ROOT,
     TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR and XDG_CACHE_HOME into it, so
     this recipe sets none of those paths itself — a path in env wins over the
-    managed one and would escape the keyed, pruned tree. The single addition is
-    FLASHINFER_WORKSPACE_BASE, because FlashInfer 0.6.18 reads only that
-    variable and derives its own cache dir internally, leaving sparkrun's
-    FLASHINFER_CACHE_DIR export inert; without it the JIT-compiled kernels sit
-    in /tmp and die with the --rm container.
+    managed one and would escape the keyed, pruned tree. FLASHINFER_WORKSPACE_BASE
+    used to be the single addition, set by hand to
+    /cache/runtime/flashinfer-home because FlashInfer 0.6.18 reads only that
+    variable and sparkrun 0.3.5's FLASHINFER_CACHE_DIR export was inert.
+    sparkrun 0.3.10 sets FLASHINFER_WORKSPACE_BASE into the runtime-cache mount
+    itself, and a recipe value would override it (recipe validate reports that
+    as managed-cache-env), so this recipe no longer sets it. The managed
+    directory is not the old hand-set one, so the first launch after that change
+    recompiles FlashInfer's small JIT cache once; any launch timings recorded
+    here were taken with the hand-set path.
 
     This model is the one where the caching story is not a simple cold-warm
     pair, because startup here is dominated by FlashInfer autotuning 115
@@ -153,6 +158,7 @@ defaults:
   tensor_parallel: 1
   gpu_memory_utilization: 0.7
   max_model_len: 131072
+  kv_cache_dtype: fp8
   max_num_batched_tokens: 32768
   max_num_seqs: 8
   served_model_name: muse-glimmer-30b-nvfp4
@@ -164,10 +170,6 @@ defaults:
 env:
   CUTE_DSL_ARCH: sm_121a
   MAX_JOBS: "4"
-  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
-  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
-  # compiled kernels land in /tmp and die with the --rm container.
-  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
 
 command: |
   vllm serve {model} \
@@ -177,7 +179,7 @@ command: |
     --tensor-parallel-size {tensor_parallel} \
     --trust-remote-code \
     --load-format instanttensor \
-    --kv-cache-dtype fp8 \
+    --kv-cache-dtype {kv_cache_dtype} \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \

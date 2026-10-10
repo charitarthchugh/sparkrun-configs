@@ -1,3 +1,9 @@
+recipe_version: "2"
+model: RadixArk/Qwen3.8-27B-NVFP4
+runtime: sglang
+min_nodes: 1
+max_nodes: 1
+container: lmsysorg/sglang:dev-qwen38-27b-dflash2
 description: >-
   RadixArk's ModelOpt NVFP4 checkpoint of Qwen3.8-27B served with SGLang on a
   single DGX Spark, drafting with the DFlash2 block-diffusion speculator. This
@@ -94,8 +100,6 @@ description: >-
   prompt_tokens_details.cached_tokens comes back 0 from both SGLang and vLLM
   here even while the engine logs real prefix-cache hits, so a client-side cache
   rate of 0% is a telemetry gap rather than a cache miss.
-model: RadixArk/Qwen3.8-27B-NVFP4
-container: lmsysorg/sglang:dev-qwen38-27b-dflash2
 mods: []
 defaults:
   port: 8000
@@ -137,7 +141,3 @@ command: |
     --speculative-num-draft-tokens {speculative_num_draft_tokens} \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder
-recipe_version: "2"
-name: Qwen3.8-27B-NVFP4-DFlash2-SGLang-DGX-Spark
-cluster_only: false
-solo_only: false

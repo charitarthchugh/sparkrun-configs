@@ -1,3 +1,9 @@
+recipe_version: "2"
+model: RadixArk/Qwen3.8-27B-NVFP4
+runtime: sglang
+min_nodes: 1
+max_nodes: 1
+container: lmsysorg/sglang:dev-qwen38-27b-dflash2
 description: >-
   RadixArk's ModelOpt NVFP4 checkpoint of Qwen3.8-27B served with SGLang on a
   single DGX Spark, drafting with the DFlash2 block-diffusion speculator. This
@@ -127,8 +133,6 @@ description: >-
   above for the still-image case; and a full tool round-trip parses, including
   an assistant history turn whose arguments field is a serialized JSON string -
   the exact payload the official template crashes on. Video is still untested.
-model: RadixArk/Qwen3.8-27B-NVFP4
-container: lmsysorg/sglang:dev-qwen38-27b-dflash2
 mods:
   - "@charitarth/qwen38-fixed-chat-template"
 defaults:
@@ -173,7 +177,3 @@ command: |
     --chat-template {chat_template} \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder
-recipe_version: "2"
-name: Qwen3.8-27B-NVFP4-DFlash2-SGLang-FixedTemplate-DGX-Spark
-cluster_only: false
-solo_only: false

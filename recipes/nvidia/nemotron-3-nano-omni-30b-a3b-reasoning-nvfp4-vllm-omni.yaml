@@ -56,6 +56,7 @@ defaults:
   tensor_parallel: 1
   gpu_memory_utilization: 0.8
   max_model_len: 131072
+  kv_cache_dtype: fp8
   max_num_batched_tokens: 32768
   max_num_seqs: 8
   served_model_name: nemotron-3-nano-omni-nvfp4
@@ -85,7 +86,7 @@ command: |
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \
     --max-num-batched-tokens {max_num_batched_tokens} \
-    --kv-cache-dtype fp8 \
+    --kv-cache-dtype {kv_cache_dtype} \
     --trust-remote-code \
     --load-format fastsafetensors \
     --video-pruning-rate 0.5 \

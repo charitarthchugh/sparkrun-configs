@@ -43,18 +43,40 @@ mappings `recipes`, `tuning`, `benchmarks: benchmarking`, `mods`, plus `enabled/
 
 ## Recipe schema (the thing you'll actually edit)
 
-Two `recipe_version` formats coexist; match the style of the file you're editing.
+Every recipe is `recipe_version: "2"` and passes `sparkrun recipe validate` (sparkrun 0.3.10)
+with no deprecation findings. `recipes/qwen/swift-qwen3.8-27b-nvfp4-vllm.yaml` is the reference
+shape. Every file opens with the same header:
 
-- **v2 with `runtime: vllm-distributed`** (e.g. `recipes/poolside/laguna-s-2.1-vllm.yaml`,
-  `recipes/nvidia/nemotron-...omni.yaml`): has a `metadata:` block (`description`, `model_params`,
-  `model_dtype`, `model_vram`, `kv_dtype`, `quantization`) and `min_nodes`/`max_nodes`.
-- **v2/v1 flat style** (e.g. the `recipes/qwen/*-27b-*.yaml`): top-level `description`, `name`,
-  `container`, `cluster_only`/`solo_only`, no `metadata`/`runtime` block.
+```yaml
+recipe_version: "2"
+model: org/Checkpoint
+runtime: vllm-distributed   # or sglang / trtllm
+builder: eugr               # only where the recipe relies on the eugr builder — declare it, never let it be inferred
+min_nodes: 1
+max_nodes: 1
+container: ...
+```
 
-Common to all: `model`, `container`, `defaults:` (a map of `{placeholder}` values), optional
-`env:`, and a `command:` block heredoc. `command` uses `{name}` placeholders that resolve from
-`defaults` (and `{model}`). When adding a knob, add it to `defaults` **and** reference it as
-`{name}` in `command` — don't hardcode values that already have a default.
+- The description is either a top-level `description:` or a `metadata:` block (`description`,
+  `model_params`, `model_dtype`, `model_vram`, `kv_dtype`, `quantization`). Both are valid; match
+  the file you're editing.
+- **Don't use** `name:` (the name comes from the filename), `solo_only`/`cluster_only` (use
+  `min_nodes`/`max_nodes`), `recipe_version: "1"`, or doubled `{{ }}` braces in `command:`
+  (write JSON with plain braces; a `{placeholder}` nested inside still resolves).
+- **Don't set cache paths in `env:`** (`FLASHINFER_WORKSPACE_BASE`, `VLLM_CACHE_ROOT`,
+  `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, `XDG_CACHE_HOME`, ...). sparkrun mounts a
+  per-model runtime cache at `/cache/runtime` and points all of them into it, and a recipe value
+  overrides that (validate reports it as `managed-cache-env`). Use `runtime_cache:` to change the
+  keying.
+- Write the model as `{model}` in `command:`, never the literal id.
+
+Common to all: `defaults:` (a map of `{placeholder}` values), optional `env:`, and a `command:`
+block heredoc. `command` uses `{name}` placeholders that resolve from `defaults` (and `{model}`).
+When adding a knob, add it to `defaults` **and** reference it as `{name}` in `command`. Don't
+hardcode values that already have a default. `kv_cache_dtype` in particular belongs in
+`defaults`, because sparkrun's VRAM estimate reads it from there. The exception is
+`qwen3.8-flash-next-ple-mmap-vllm`, which keeps `--kv-cache-dtype auto` literal: with `auto` in
+`defaults`, sparkrun 0.3.10's estimator falls through to the raw command and mis-reads it.
 
 ## DGX Spark serving conventions
 

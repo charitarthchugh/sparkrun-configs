@@ -1,3 +1,9 @@
+recipe_version: "2"
+model: inclusionAI/Ling-3.0-flash-fp4
+runtime: sglang
+min_nodes: 1
+max_nodes: 1
+container: lmsysorg/sglang:dev-Ling-3.0-flash
 description: >-
   Ling-3.0-flash on a single DGX Spark with the checkpoint's own NextN/MTP head
   as the speculator, which is what upstream's quickstart recommends
@@ -83,8 +89,6 @@ description: >-
   checkpoint choice, the earlyoom reason behind mem-fraction-static 0.80, and
   the two unresolved warnings this checkpoint emits about rope_scaling and the
   tokenizer backend.
-model: inclusionAI/Ling-3.0-flash-fp4
-container: lmsysorg/sglang:dev-Ling-3.0-flash
 mods: []
 defaults:
   port: 8000
@@ -119,7 +123,3 @@ command: |
     --reasoning-parser ling3 \
     --speculative-algorithm NEXTN \
     --tool-call-parser ling3
-recipe_version: "2"
-name: Ling-3.0-flash-FP4-MTP-SGLang-DGX-Spark
-cluster_only: false
-solo_only: false

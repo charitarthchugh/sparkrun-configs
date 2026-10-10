@@ -1,3 +1,9 @@
+recipe_version: "2"
+model: Qwen/Qwen3.8-27B-FP8
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: eugr/spark-vllm:latest
 description: >-
   Qwen's own FP8 checkpoint of Qwen3.8-27B on a single DGX Spark, drafting with
   z-lab/Qwen3.8-27B-DFlash2 instead of the checkpoint's built-in MTP head. This
@@ -79,8 +85,6 @@ description: >-
   passed to it and the draft runs on text-only inputs. Drafting quality on
   image-grounded turns should be expected to suffer; none of the numbers above
   cover that case.
-model: Qwen/Qwen3.8-27B-FP8
-container: eugr/spark-vllm:latest
 mods:
   - "@charitarth/dflash2-vllm"
 defaults:
@@ -89,6 +93,7 @@ defaults:
   tensor_parallel: 1
   gpu_memory_utilization: 0.7
   max_model_len: 262144
+  kv_cache_dtype: fp8
   max_num_batched_tokens: 32768
   max_num_seqs: 16
   limit_mm_per_prompt: '{"image": 1, "video": 0}'
@@ -96,10 +101,6 @@ defaults:
   served_model_name: qwen3.8-27b
   speculative_config: '{"method":"dflash","model":"z-lab/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
 env:
-  # FlashInfer 0.6.18 reads only this env var for its JIT cache location
-  # (sparkrun's FLASHINFER_CACHE_DIR export is inert), so without it the
-  # compiled kernels land in /tmp and die with the --rm container.
-  FLASHINFER_WORKSPACE_BASE: /cache/runtime/flashinfer-home
   MAX_JOBS: '2'
   NVCC_THREADS: '2'
   FLASHINFER_NVCC_THREADS: '2'
@@ -107,14 +108,14 @@ env:
   VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
   FLASHINFER_DISABLE_VERSION_CHECK: '1'
 command: |
-  vllm serve Qwen/Qwen3.8-27B-FP8 \
+  vllm serve {model} \
     --host {host} \
     --port {port} \
     --served-model-name {served_model_name} \
     --tensor-parallel-size {tensor_parallel} \
     --trust-remote-code \
     --load-format instanttensor \
-    --kv-cache-dtype fp8 \
+    --kv-cache-dtype {kv_cache_dtype} \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --max-model-len {max_model_len} \
     --max-num-batched-tokens {max_num_batched_tokens} \
@@ -128,7 +129,3 @@ command: |
     --tool-call-parser qwen3_xml \
     --reasoning-parser qwen3 \
     --speculative-config '{speculative_config}'
-recipe_version: "2"
-name: Qwen3.8-27B-FP8-DFlash2-DGX-Spark
-cluster_only: false
-solo_only: false
