@@ -1,0 +1,106 @@
+recipe_version: "2"
+model: ukisai/Swift-Qwen3.8-27B-NVFP4
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: eugr/spark-vllm:latest
+
+metadata:
+  description: >-
+    UkisAI's Swift-Qwen3.8-27B in its NVFP4/FP8 ModelOpt quant on a single DGX
+    Spark, with the same profile as qwen3.8-27b-nvfp4-vllm: vision tower kept,
+    fp8 KV, the checkpoint's MTP head at k=3, async scheduling and the full
+    native 262144-token context. Swift is a fine-tune of Qwen3.8-27B that
+    penalizes the reasoning-marker tokens the authors found trigger
+    overthinking. UkisAI reports 41% fewer mean thinking tokens on GPQA-Diamond
+    at xhigh effort, with GPQA going from 88.38% to 88.28%. AIME 2026 does drop
+    more, from 98.67% to 94.00%. It also carries a transfer component from
+    ThinkingCap-Qwen3.6-27B. The repo is gated under the Swift Open License
+    v1.0, which is free below US$1M annual revenue. Accept the gate on the Hub
+    before the first pull.
+
+    This is a ModelOpt MIXED_PRECISION checkpoint, not compressed-tensors like
+    the Unsloth one. --quantization is omitted so vLLM autodetects it from
+    hf_quant_config.json; qwen3.6-35b-a3b on this same image resolves the same
+    MIXED_PRECISION format to modelopt_mixed. The layout follows NVIDIA's
+    Qwen3.8-27B-NVFP4 mapping: NVFP4 (group 16) on the 192 MLP projections and
+    lm_head, FP8 E4M3 on the 144 large Gated DeltaNet projections and the 64
+    full-attention projections, and BF16 for embeddings, norms, the vision tower
+    and the MTP head. That comes to about 21.9 GB on disk and a reported 20.0
+    GiB of weight memory, a few GB under the Unsloth quant, so the 0.7 memory
+    budget from that recipe leaves more room for KV here.
+
+    Two things differ from the model card on purpose. The card serves with
+    --kv-cache-dtype auto (BF16 KV), but this recipe keeps fp8 to match the rest
+    of the registry. It also uses qwen3_xml where the card uses qwen3_coder,
+    since both read the same <tool_call>/<function=> format.
+
+    The checkpoint's own chat template is used deliberately, not the
+    qwen38-fixed-chat-template mod. That template defaults reasoning_effort to
+    xhigh, which is exactly the setting Swift was tuned to shorten, while the
+    mod's medium default would give away most of the point of this fine-tune.
+
+    UkisAI only validated this quant on H100 with Marlin weight-only NVFP4 on
+    vLLM 0.28.0, and says native Blackwell W4A4 is untested. vLLM may fall back
+    to Marlin on GB10 as it does for qwen3.6-35b-a3b, so check the kernel line
+    in the logs. The recipe has not been served on this node yet. Only sparkrun
+    recipe validate and a weight download were run on 2026-09-16, so KV
+    capacity, MTP acceptance and throughput are all still unmeasured.
+
+    Written to pass sparkrun 0.3.9's recipe validate with no deprecation
+    findings, which is the nearest thing to a v3 spec that exists upstream:
+    explicit runtime, min_nodes/max_nodes rather than solo_only/cluster_only, no
+    name: key and no doubled-brace escapes. FLASHINFER_WORKSPACE_BASE is left to
+    sparkrun, since 0.3.9 points it at the runtime-cache mount itself and a
+    recipe value would override that and escape the persisted tree. On sparkrun
+    0.3.6 that means FlashInfer's small JIT cache is rebuilt each launch.
+  quantization: nvfp4
+  model_params: 27B
+  model_dtype: nvfp4
+  model_vram: 20
+  kv_dtype: fp8
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 32768
+  max_num_seqs: 16
+  limit_mm_per_prompt: '{"image": 1, "video": 0}'
+  mm_processor_kwargs: '{"size": {"longest_edge": 2097152, "shortest_edge": 65536}}'
+  served_model_name: swift-qwen3.8-27b
+  speculative_config: '{"method":"mtp","num_speculative_tokens":3}'
+
+env:
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --load-format instanttensor \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --limit-mm-per-prompt '{limit_mm_per_prompt}' \
+    --mm-processor-kwargs '{mm_processor_kwargs}' \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --speculative-config '{speculative_config}'
