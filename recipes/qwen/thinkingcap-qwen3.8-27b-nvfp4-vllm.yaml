@@ -1,0 +1,129 @@
+recipe_version: "2"
+model: bottlecapai/ThinkingCap-Qwen3.8-27B-NVFP4
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: eugr/spark-vllm:latest
+
+metadata:
+  description: >-
+    BottleCap AI's ThinkingCap-Qwen3.8-27B in their own NVFP4 build on a single
+    DGX Spark, with the same profile as qwen3.8-27b-nvfp4-vllm: vision tower
+    kept, fp8 KV, the checkpoint's MTP head at k=3, async scheduling and the
+    full native 262144-token context (max_position_embeddings in config.json).
+    ThinkingCap is a fine-tune of Qwen3.8-27B that BottleCap report cuts
+    reasoning tokens by 37% on average (11-66% by benchmark) at 85.8% average
+    accuracy against the base model's 86.6%. The repo is gated under PolyForm
+    Small Business 1.0.0 plus a personal-use grant. Accept the gate on the Hub
+    before the first pull.
+
+    The quantization is compressed-tensors nvfp4-pack-quantized from
+    llm-compressor (scheme NVFP4A16), the same format as the
+    thinkingcap-qwen3.6-27b recipe, so --quantization is omitted and vLLM
+    autodetects it. It is weight-only: 4-bit E2M1 weights in groups of 16 with
+    FP8 scales against bf16 activations, so it serves through the Marlin FP4
+    kernel rather than native FP4 tensor cores, and a "GPU does not have native
+    support for FP4" warning in the log is expected. lm_head, the MTP head, the
+    vision tower and the Gated DeltaNet in_proj_a / in_proj_b projections stay
+    bf16. The index reports 20.6 GB of weights. The card notes in_proj_qkv and
+    in_proj_z share one global scale because vLLM fuses them into one GEMM.
+
+    The card's own throughput table (RTX PRO 6000, vLLM 0.29.0) is worth
+    reading before tuning: this build is 2.6x bf16 at one request but no faster
+    at 32k-token prompts, with a later first token. Its MTP speedup is also
+    smaller than on bf16 (1.23x against 1.70x on H200), because Marlin decode
+    is already cheaper. Long-prompt-heavy work may do better on the
+    qwen3.8-27b-nvfp4-vllm recipe, which runs native FP4 compute.
+
+    Tuning is inherited from qwen3.8-27b-nvfp4-vllm and
+    swift-qwen3.8-27b-nvfp4-vllm; see the measurement below. Weights are close to the
+    Swift build's 20 GiB, so the 0.7 memory budget should leave over 30 GB for
+    the host, well above the 2 GiB floor. The 0.7 figure was measured on the
+    Unsloth build, which kept about 26-30 GB available while serving. Qwen3.8
+    has full attention on only 16 of 64 layers, so KV is cheap and 262144
+    context fits easily. YaRN to 1M is deliberately not enabled. The
+    mm_processor_kwargs cap is carried over because the vision tower is
+    unchanged and images past ~1500x1500 otherwise fail with a 400.
+
+    Parsers follow the card's own vLLM command: qwen3 reasoning and qwen3_xml
+    tool calls. The checkpoint's chat template is used, not the
+    qwen38-fixed-chat-template mod, because it defaults reasoning_effort to
+    xhigh and BottleCap recommend xhigh for this model. Sampling comes from
+    generation_config.json (temperature 1.0, top_p 0.95, top_k 20), so no
+    override is set. The base-model card's vLLM 0.29 example adds
+    "draft_sample_method":"probabilistic" to the MTP config, which it measures
+    at 2.8-3.3 accepted tokens per step against 2.5-3.0. It is left out because
+    the vLLM version in eugr/spark-vllm:latest has not been checked for that
+    key. The image turned out to ship vLLM 0.30.1rc1.dev723 (newer than 0.29),
+    so the key should now be accepted, but it has not been tried and the
+    acceptance figures below are without it. BottleCap built and tested on vLLM
+    0.29 and only on Hopper and RTX PRO 6000 Blackwell, not GB10.
+
+    Measured on this node 2026-10-07, first launch on sparkrun 0.3.10 with an
+    empty runtime cache, vLLM 0.30.1rc1.dev723. vLLM resolves
+    quantization=compressed-tensors and picks MarlinNvFp4LinearKernel, logging
+    the expected "no native support for FP4" warning, so this runs Marlin
+    weight-only FP4 like the ThinkingCap 3.6 recipe. instanttensor loaded the
+    weights in 1.98 s; model loading took 19.62 GiB in 11.02 s. Available KV
+    cache 52.7 GiB, 1,486,458 tokens, 5.67x concurrency at 262144. init engine
+    took 192.28 s (34.25 s compilation), and the server answered health checks
+    258 s after the container started. A chat request returned the right answer
+    with reasoning_content filled (unlike the ThinkingCap 3.6 recipe, where it
+    came back null), and a get_weather tool call parsed into tool_calls with
+    correct arguments. Single-stream decode was 22.7-25.1 tok/s, including
+    thinking. MTP k=3 over the session: 1869 drafts, 75.6% draft acceptance,
+    mean acceptance length 3.27, per position 0.844/0.741/0.683. Host memory
+    while serving: 90 GB used, about 30 GB available, well above the 2 GiB
+    floor.
+  quantization: nvfp4
+  model_params: 27B
+  model_dtype: nvfp4
+  model_vram: 21
+  kv_dtype: fp8
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  kv_cache_dtype: fp8
+  load_format: instanttensor
+  max_num_batched_tokens: 32768
+  max_num_seqs: 16
+  limit_mm_per_prompt: '{"image": 1, "video": 0}'
+  mm_processor_kwargs: '{"size": {"longest_edge": 2097152, "shortest_edge": 65536}}'
+  served_model_name: thinkingcap-qwen3.8-27b
+  tool_call_parser: qwen3_xml
+  reasoning_parser: qwen3
+  speculative_config: '{"method":"mtp","num_speculative_tokens":3}'
+
+env:
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --tensor-parallel-size {tensor_parallel} \
+    --load-format {load_format} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --limit-mm-per-prompt '{limit_mm_per_prompt}' \
+    --mm-processor-kwargs '{mm_processor_kwargs}' \
+    --enable-chunked-prefill \
+    --async-scheduling \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser {tool_call_parser} \
+    --reasoning-parser {reasoning_parser} \
+    --speculative-config '{speculative_config}'
