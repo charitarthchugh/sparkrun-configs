@@ -133,6 +133,7 @@ command: |
     --host {host} \
     --port {port} \
     --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
     --trust-remote-code \
     --tensor-parallel-size {tensor_parallel} \
     --pipeline-parallel-size {pipeline_parallel} \

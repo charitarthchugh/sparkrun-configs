@@ -111,6 +111,7 @@ command: |
     --host {host} \
     --port {port} \
     --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
     --tensor-parallel-size {tensor_parallel} \
     --load-format {load_format} \
     --kv-cache-dtype {kv_cache_dtype} \

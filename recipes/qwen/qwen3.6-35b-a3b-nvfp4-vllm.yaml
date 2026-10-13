@@ -88,6 +88,7 @@ command: |
     --host {host} \
     --port {port} \
     --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
     --tensor-parallel-size {tensor_parallel} \
     --trust-remote-code \
     --kv-cache-dtype {kv_cache_dtype} \

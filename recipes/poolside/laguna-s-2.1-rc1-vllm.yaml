@@ -222,6 +222,7 @@ command: |
     --code-revision {revision} \
     --tokenizer-revision {revision} \
     --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
     --trust-remote-code \
     --dtype auto \
     --load-format instanttensor \

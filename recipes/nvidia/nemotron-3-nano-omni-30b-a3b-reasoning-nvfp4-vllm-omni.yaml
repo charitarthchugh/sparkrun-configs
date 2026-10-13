@@ -79,6 +79,7 @@ command: |
   python3 -m pip install "vllm[audio]" && \
   vllm serve "$runtime_model_dir" \
     --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
     --host {host} \
     --port {port} \
     --tensor-parallel-size {tensor_parallel} \

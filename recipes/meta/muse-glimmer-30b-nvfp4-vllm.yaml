@@ -174,6 +174,7 @@ env:
 command: |
   vllm serve {model} \
     --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
     --host {host} \
     --port {port} \
     --tensor-parallel-size {tensor_parallel} \
