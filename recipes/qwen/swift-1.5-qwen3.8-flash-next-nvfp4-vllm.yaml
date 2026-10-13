@@ -1,0 +1,153 @@
+recipe_version: "2"
+model: ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4
+runtime: vllm-distributed
+builder: eugr
+min_nodes: 1
+max_nodes: 1
+container: vllm-node-b12x
+description: >-
+  UkisAI's Swift 1.5 Qwen3.8-Flash-Next in their NVFP4 quant on a single DGX
+  Spark, built from qwen3.8-flash-next-nvfp4-vllm: same eugr b12x image, the
+  n-gram table on NVMe through io_uring, fp8 KV, prefix caching, the MTP head
+  at k=3 and the full native 262144-token context. Swift 1.5 is a fine-tune of
+  Qwen3.8-Flash-Next that penalizes the reasoning-marker tokens linked to
+  overthinking, then wins the accuracy back with RL and on-policy
+  distillation. UkisAI reports 55.8% fewer mean (63.4% fewer median) thinking
+  tokens at xhigh effort for a 0.20-point accuracy loss against the BF16 base.
+  The repo is gated under the Swift Open License v1.0, which is free below
+  US$1M annual revenue, and the Qwen Community License still applies to the
+  base, so accept the gate on the Hub before the first pull.
+
+  This is a different quant from local-inference-lab's checkpoint, and three
+  settings follow from that. First, it is ModelOpt NVFP4_EXPERTS_ONLY_CFG
+  (quant_algo NVFP4, not MIXED_PRECISION), so --quantization is modelopt_fp4,
+  the name vLLM's ModelOpt config resolves NVFP4 to, rather than
+  modelopt_mixed. Only the 48 layers' routed experts are NVFP4 W4A4 (group
+  16, calibrated on 128 ultrachat samples, with input_scale on every expert
+  projection, which b12x's W4A4 MoE requires). Everything else is BF16: the
+  36 Gated DeltaNet and 12 QSA blocks, shared experts, router gates, hyper-
+  connections, lm_head, the vision tower and the whole MTP head, routed
+  experts included. In the base checkpoint those were MXFP8 or NVFP4. The
+  Qwen4Exp b12x model code forces QSA unquantized under modelopt_fp4 anyway,
+  and b12x's unquantized MoE oracle accepts --moe-backend b12x, so the MTP
+  head's BF16 experts take that path. --linear-backend b12x now covers
+  BF16 dense layers rather than MXFP8 ones; in this image's linear.py the
+  unquantized method attaches b12x's BF16 GEMV (maybe_attach_b12x_bf16_gemv)
+  when that backend is selected. fuse_act_quant has fewer quantized linears
+  to fuse here.
+
+  Second, the n-gram table is BF16, 95.37 GiB of the 173.56 GiB checkpoint
+  (summed from the safetensors headers), against 26.88 GiB for the quantized
+  table in the base checkpoint. config.json leaves ple_embedding_dtype unset,
+  which b12x reads as bfloat16, and BF16 is the dtype b12x's io_uring disk
+  reader is built for: it is the dtype that defaults to disk mode even
+  without VLLM_PLE_TABLE_MEMORY. disk mode is kept explicit here, so the
+  security_opt block below is load-bearing exactly as in the base recipe,
+  including its trust gate. Run by file path or from a trusted registry. The
+  NVMe now holds a 95 GiB table rather than 27 GiB, so each prefill reads
+  rows from a table 3.5x larger. Expect cold-cache prefill to land below the
+  base recipe's ~812 tok/s until that is measured.
+
+  Third, the resident set is larger. Excluding the disk-backed table it is
+  63.28 GiB of NVFP4 routed experts plus 9.15 GiB of BF16 backbone, 4.86 GiB
+  of BF16 MTP head and 0.84 GiB of vision tower, about 78.2 GiB against the
+  base recipe's measured 73.77 GiB. At the same gpu_memory_utilization of 0.8
+  that should leave roughly 12 GiB of KV instead of 16.72, about 780k fp8
+  tokens or ~3x concurrency at the full 262144 context, rather than 4.03x.
+  That figure is extrapolated, not measured: read the real one from the
+  "GPU KV cache size" log line. max_num_seqs stays at 8, which the pool
+  covers at shorter contexts. The base recipe left the host 15-17 GiB at 0.8,
+  so raising it eats into this node's 2 GiB guard floor. The weights are
+  173.6 GiB on disk, split as embedding-mixed, 31 embedding-model shards for
+  the n-gram table, 48 model-layer files and model-tail.
+
+  Validation status is thin. UkisAI ran only a two-prompt smoke test on 4x
+  H100 with TP4/EP and Marlin weight-only fallback (BF16 activations), and
+  states that blackwell_native_validation and the quality benchmark were not
+  run. So native W4A4 on GB10 is untested upstream, and this recipe has only
+  passed sparkrun recipe validate and a dry run on 2026-10-11; it has not
+  been served on this node. Check the MoE backend selection line in the
+  serve log on the first launch. Load time, KV size, MTP acceptance with the BF16 head and throughput are
+  all unmeasured.
+
+  Model behaviour carried over from the card: generation_config.json sets
+  temperature 1.0, top_p 0.95 and top_k 20 (Qwen's thinking-mode values),
+  and the checkpoint's chat_template.jinja defaults reasoning_effort to
+  xhigh, the setting Swift was tuned for and the one with the 0.20-point
+  loss. medium and low are accepted through chat_template_kwargs but lose
+  2.62 and 2.42 points. Tool calls use qwen3_xml and the qwen3 reasoning
+  parser, both unchanged from the base, since the template emits the same
+  <tool_call><function=...> format. Everything else (b12x loader and
+  kernels, AOT compile, build caps, the k=3 MTP rationale) is inherited from
+  qwen3.8-flash-next-nvfp4-vllm; see that recipe for the measurements behind
+  it. As there, expect sparkrun's VRAM estimate to overcount, because it
+  includes the disk-resident table. The model is multimodal, but the vision
+  path has not been exercised.
+build_args:
+  - --exp-b12x
+executor_config:
+  # b12x's disk PLE reader needs io_uring, which Docker's default seccomp
+  # profile blocks. This list replaces sparkrun's rootless default rather than
+  # merging with it, so the first two entries re-list that hardening.
+  security_opt:
+    - no-new-privileges
+    - label=disable
+    - seccomp=unconfined
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  pipeline_parallel: 1
+  block_size: 16
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  kv_cache_dtype: fp8
+  max_num_seqs: 8
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 3
+  served_model_name: swift-1.5-qwen3.8-flash-next
+env:
+  # Keeps the 95.37 GiB BF16 n-gram table on NVMe; this is what needs io_uring.
+  VLLM_PLE_TABLE_MEMORY: disk
+  CUTE_DSL_ARCH: sm_121a
+  SAFETENSORS_FAST_GPU: '1'
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_USE_AOT_COMPILE: '1'
+  VLLM_USE_MEGA_AOT_ARTIFACT: '1'
+  VLLM_USE_V2_MODEL_RUNNER: '1'
+  B12X_POLICY_MODE: auto
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --mamba-cache-mode align \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --dtype bfloat16 \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --quantization modelopt_fp4 \
+    --block-size {block_size} \
+    --load-format b12x \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}' \
+    --gdn-decode-kernel b12x \
+    --linear-backend b12x \
+    --moe-backend b12x \
+    --no-enable-flashinfer-autotune \
+    --mm-encoder-tp-mode data \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice \
+    --compilation-config '{"pass_config":{"fuse_act_quant":true}}' \
+    --gpu-memory-utilization {gpu_memory_utilization}
