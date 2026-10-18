@@ -1,0 +1,169 @@
+recipe_version: "2"
+model: nvidia/Qwen3.8-Flash-Next-FP4-Local
+runtime: vllm-distributed
+builder: eugr
+min_nodes: 1
+max_nodes: 1
+container: vllm-node-b12x
+description: >-
+  NVIDIA's Qwen3.8-Flash-Next-FP4-Local (125B total, 6B active, plus a 51B
+  n-gram embedding table and a 4B MTP head) on a single DGX Spark, serving the
+  full native 262144-token context with fp8 KV, prefix caching and the MTP
+  head at k=3. Built from qwen3.8-flash-next-nvfp4-vllm and the model card's
+  own DGX Spark launch, which is that recipe's command plus five env vars:
+  same eugr b12x image, b12x loader and kernels, the n-gram table on NVMe
+  through io_uring, and --quantization modelopt_mixed.
+
+  What makes this checkpoint different is how it was made and how its scales
+  are stored. It is quantization-aware distilled (QAD) with ModelOpt 0.47.0:
+  a BF16 teacher supplies token-probability and hidden-state targets, and
+  the NVFP4/MXFP8 weights, the n-gram tables included, are trained to match
+  them. NVIDIA reports GPQA Diamond 91.5% and ToolEvalBench 88.7% against
+  92.2% and 89.4% for BF16. Routed experts in all 48 layers are NVFP4 W4A4
+  (group 16), attention projections and shared experts MXFP8 (group 32), the
+  MTP head's routed experts NVFP4 with BF16 activations, and the vision tower
+  mixes MXFP8 attention, NVFP4 MLP and BF16. The n-gram table is NVFP4
+  (ple_embedding_dtype nvfp4). lm_head and the rest of the MTP head are left
+  BF16 in the checkpoint. The expert block scales use a new lossless
+  compressed encoding (weight_scale_encoding csf) that upstream vLLM cannot
+  read yet, so the card requires the community b12x containers. The eugr
+  b12x nightly carries nvfp4_csf.py and csf_utils.py from at least the
+  2026-10-13 build (vLLM 0.1.dev21818+g3a947437c), and every env var below
+  is read by it. If the image moves back to a build without them, the
+  weights fail to load. On disk it is 95.17 GiB in 21 shards under tensors/, against 98.53
+  GiB for local-inference-lab's checkpoint.
+
+  The env vars the card adds. VLLM_B12X_MOE_FP4_FORCE_A16 runs the NVFP4 MoE
+  with BF16 activations, and B12X_W4A16_A4_PREFILL opts prefill back into
+  FP4 activations, so decode is W4A16 and prefill W4A4 where the base recipe
+  is W4A4 throughout. The A4-prefill path refuses DP, PCP, EP, sequence
+  parallelism, ubatching and adaptive speculative verification, none of
+  which a single-node TP1 launch uses. VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE
+  w13 uses one layer-wide activation scale for the gate/up projections.
+  VLLM_MXFP8_LM_HEAD quantizes the BF16 lm_head to MXFP8 at load time. That
+  is a runtime choice, not something in the checkpoint, and it is the
+  card's setting, not something tuned here. B12X_DISK_BACKEND io_uring is
+  already the default in this build and is kept explicit to match the card.
+  The card's docker run also passes apparmor=unconfined. Only seccomp is
+  needed on this node, as the base recipe showed, so the security_opt block
+  below is the base recipe's, including its trust gate: run by file path or
+  from a trusted registry.
+
+  The card launches with num_speculative_tokens 4. This recipe keeps the
+  base recipe's 3. On this node a 12-request mixed session against the
+  sibling checkpoint's MTP head, also NVFP4 routed experts, showed the
+  fourth draft slot adding about 0.2 tokens per step while costing a full
+  slot in every verify pass. That was a different quant of the head, and
+  QAD may have moved its acceptance, so try -o num_speculative_tokens=4 for
+  code-heavy traffic and compare; k=4 has not been run here.
+
+  Measured on this node 2026-10-16 on vLLM 0.1.dev21830+g8244d1c44 in the
+  eugr b12x nightly of 2026-10-15, with a cold runtime cache. The weights
+  read in 129.92 s plus 1.63 s for the MTP head, and model loading came to
+  70.04 GiB resident in 220.0 s, against 73.77 GiB in 71.8 s for the base
+  recipe. The serve log confirms the B12X NvFp4 MoE backend. Init engine
+  took 963.94 s, against the base recipe's 275 s. Much of the difference is
+  b12x autotuning its csf_block_expansion kernels (157 of them) for the
+  compressed scales, which lands in the runtime cache, so warm restarts
+  should be shorter; that has not been timed. At gpu_memory_utilization 0.8
+  the KV pool is 957,222 tokens, 3.65x concurrency at the full 262144
+  context. That is about 10% less than the base recipe's 1,057,294 (4.03x)
+  despite 3.7 GiB less resident weight, so something else (plausibly CSF
+  expansion workspace or the A16 MoE path; not traced) takes the
+  difference. The card's "1M tokens" is the right order but not reached
+  here. The host kept 16 GiB available while serving, well clear of this
+  node's 2 GiB guard floor. Throughput, bs1, temperature 0, thinking off,
+  800 max tokens, k=3: a 29.3k-token code prompt (vLLM scheduler source,
+  random prefix, 0 cached tokens) reached first token in 13.1-13.2 s (~2230
+  tok/s prefill) and decoded at 47.1-49.3 tok/s, with 57.3-62.1% MTP
+  acceptance and mean acceptance length 2.72-2.86. The base recipe's
+  closest figure is a 30,065-token code prompt at 812 tok/s prefill and
+  32.0 tok/s decode at k=4. That makes prefill about 2.7x and decode about
+  1.5x faster here, though the prompts and k differ, so it is not a
+  controlled comparison. A short code prompt with no long context decoded
+  at 58.5-59.0 tok/s with 79.8% acceptance (mean length 3.39). Tool calls
+  emit a parsed tool_calls entry with finish_reason tool_calls. Mixed-traffic
+  acceptance, concurrency scaling and warm-start time are unmeasured.
+  Behaviour carried over from
+  the card and base: generation_config.json sets temperature 1.0, top_p 0.95
+  and top_k 20 (Qwen's thinking-mode values), tool calls use qwen3_xml with
+  the qwen3 reasoning parser, and the trace comes back in the message's
+  "reasoning" field. Expect sparkrun's VRAM estimate to overcount, because
+  it includes the disk-resident table. The model is multimodal, but the
+  vision path has not been exercised. Licensed under the NVIDIA Open Model
+  Agreement, with the Qwen Community License 1.0 applying to the base.
+build_args:
+  - --exp-b12x
+executor_config:
+  # b12x's disk PLE reader needs io_uring, which Docker's default seccomp
+  # profile blocks. This list replaces sparkrun's rootless default rather than
+  # merging with it, so the first two entries re-list that hardening.
+  security_opt:
+    - no-new-privileges
+    - label=disable
+    - seccomp=unconfined
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  pipeline_parallel: 1
+  block_size: 16
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  kv_cache_dtype: fp8
+  max_num_seqs: 8
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 3
+  served_model_name: qwen3.8-flash-next
+env:
+  # Keeps the NVFP4 n-gram table on NVMe; this is what needs io_uring.
+  VLLM_PLE_TABLE_MEMORY: disk
+  B12X_DISK_BACKEND: io_uring
+  # The card's checkpoint-specific settings: W4A16 MoE decode, W4A4 prefill,
+  # a layer-wide w13 input scale, and an MXFP8 lm_head quantized at load.
+  VLLM_B12X_MOE_FP4_FORCE_A16: '1'
+  B12X_W4A16_A4_PREFILL: '1'
+  VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: w13
+  VLLM_MXFP8_LM_HEAD: '1'
+  CUTE_DSL_ARCH: sm_121a
+  SAFETENSORS_FAST_GPU: '1'
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_USE_AOT_COMPILE: '1'
+  VLLM_USE_MEGA_AOT_ARTIFACT: '1'
+  VLLM_USE_V2_MODEL_RUNNER: '1'
+  B12X_POLICY_MODE: auto
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --mamba-cache-mode align \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --dtype bfloat16 \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --quantization modelopt_mixed \
+    --block-size {block_size} \
+    --load-format b12x \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}' \
+    --gdn-decode-kernel b12x \
+    --linear-backend b12x \
+    --moe-backend b12x \
+    --no-enable-flashinfer-autotune \
+    --mm-encoder-tp-mode data \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice \
+    --compilation-config '{"pass_config":{"fuse_act_quant":true}}' \
+    --gpu-memory-utilization {gpu_memory_utilization}
