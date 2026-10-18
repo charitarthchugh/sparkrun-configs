@@ -1,0 +1,184 @@
+recipe_version: "2"
+model: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: vllm/vllm-openai:nightly
+
+metadata:
+  description: >-
+    NVIDIA Nemotron 3.5 Super VL (120B total, 12B active) in NVIDIA's own NVFP4
+    quant, served on one DGX Spark at the model's full native 1,048,576-token
+    context. The registry's usual 262144 floor doesn't apply here because 1M
+    was asked for explicitly. The card's deployment table lists exactly this
+    configuration for "1x DGX Spark | vLLM": text and image, 1M-token context,
+    MTP with 5 draft tokens. The flags follow the card's DGX Spark vLLM
+    command, with the speculative method switched from LiLiCorr to the
+    checkpoint's native MTP head at k=5.
+
+    Why 1M fits on a Spark: the backbone is 40 Mamba-2 layers, 40 latent-MoE
+    layers and only 8 attention layers, each with 2 KV heads of dim 128. At
+    fp8 that makes the KV cache 8 x 2 x 128 x 2 bytes = 4 KiB per token, or
+    4 GiB for the whole 1,048,576-token window. Mamba state is per sequence,
+    not per token: 40 x 128 heads x 64 x 128 state x 2 bytes is about 80 MiB
+    at float16. Weights are 69.9 GiB across 88 shards. In practice the KV pool
+    costs about 10 KiB per token, not 4, because vLLM pages the Mamba state
+    into the same pool and pads the attention groups. The budget is 0.80, not
+    the card's 0.75. On the LiLiCorr sibling, measured 2026-10-15, 0.75 gave
+    13.21 GiB of KV (1,377,740 tokens, 1.31x the window) with available
+    memory bottoming out at 11.6 GiB. 0.80 gives 19.21 GiB (2,005,528 tokens,
+    1.91x), with a startup low of 7.8 GiB and about 11.3 GiB steady after a
+    benchmark. The extra room is what keeps 1M comfortable on fp8 KV with
+    uncalibrated scales (below). This recipe has no drafter, so it should
+    land roughly 1.3 GB higher.
+
+    Speculative decoding uses MTP, not LiLiCorr, because of context. The card's
+    Spark quick-start uses the separate LiLiCorr drafter (dflash, k=7) and calls
+    it recommended "in all scenarios" on Spark. However, the LiLiCorr card
+    states that its serving configuration sets a 114,688-token limit. The
+    drafter's own config isn't capped (max_position_embeddings 1048576, 8192
+    sliding window), but the only Spark configuration NVIDIA ties to 1M is MTP
+    with 5 draft tokens. LiLiCorr publishes SPEED-Bench acceptance of 4.74
+    (T=0) and 4.36 (T=1) at k=7. It lives in the sibling recipe
+    nemotron-3.5-super-vl-120b-a12b-nvfp4-lilicorr-vllm.
+
+    Container tracks the moving vllm/vllm-openai:nightly tag, which has an
+    arm64 manifest, rather than the card's pinned nightly-3f1bcfd8
+    (2026-10-15). The card's alternative, v0.32.0, isn't on Docker Hub yet.
+    Tracking means a later nightly can rename or drop a flag without warning.
+    If a launch fails on argument parsing, fall back to the card's pinned tag
+    first. The spark-arena b12x nightly (vLLM 3a947437) was checked on
+    2026-10-15 by running this recipe's exact flag list through its vLLM
+    argument parser. It registers the model and MTP head and accepts every
+    flag except --enable-mamba-shared-prefix-checkpoint. It also has no
+    LiLiCorr support.
+
+    Weights load with --load-format instanttensor, as on the eugr-image
+    recipes. The card uses the default loader. The nightly image ships the
+    instanttensor package, and PyPI now also has an aarch64 wheel (0.2.2). On
+    the ~70 GiB poolside RC3 checkpoint, instanttensor loaded in ~30 s where
+    the default mmap loader took ~429 s, and it never approached memory
+    exhaustion, while fastsafetensors took the node down. With the default
+    loader, this checkpoint's first launch dropped available memory to
+    ~35 GiB by shard 43 of 88. If instanttensor misbehaves, removing the flag
+    goes back to the card's default.
+
+    Mamba settings come straight from the card's Spark command: flashinfer
+    Mamba backend, float16 SSM cache with stochastic rounding (5 philox rounds),
+    shared-prefix checkpointing, block size 64 and prefix-match unit 64. The
+    config.json default SSM cache dtype is float32. The card overrides it on
+    every platform. Video flags are kept as in the Spark command (2 fps, up to
+    256 frames, 0.5 pruning), although the deployment table lists Spark as text
+    and image only. The card suggests 1 fps and 128 frames for 1080p.
+
+    Deliberate differences from the card. First, --kv-cache-dtype fp8 is
+    explicit, as in the rest of the registry. That is backed by
+    hf_quant_config.json's kv_cache_quant_algo FP8, but the card omits the flag
+    on every platform. The checkpoint ships k_scale and v_scale only for the
+    MTP layer, not for the 8 main attention layers, so vLLM warns that it is
+    using scale 1.0 for them. The q_scale and prob_scale warnings don't apply,
+    because FlashInfer keeps queries in bf16 on this build. That is the same KV
+    the card runs, since vLLM resolves auto to the checkpoint's FP8. bf16 KV
+    would remove the concern but roughly halve token capacity, which can't
+    back 1M on this node. fp8 is kept on purpose.
+
+    Second, --kernel-config routes fp8_w8a8 linears to torch (cuBLASLt), as the
+    card's GB200 command does. The Mamba in/out projections, the attention QKV
+    and the LM head are fp8. On this build they otherwise go to
+    FlashInferFP8ScaledMMLinearKernel, whose autotuner has no tuned config for
+    any of their shapes on GB10. It logged "No tuned config covers fp8_gemm
+    ... falling back to runner=CutlassFp8GemmRunner tactic=-1" for every
+    decode and prefill size. Measured on the LiLiCorr sibling, the switch
+    removes all of those warnings at about the same speed: 9.6 vs 9.8 verify
+    steps/s across three 1024-token T=0 prompts. NVFP4 GEMMs stay on
+    FlashInferCutlassNvFp4LinearKernel and the MoE on FLASHINFER_CUTLASS, both
+    native W4A4.
+
+    Third, max_model_len is set explicitly to 1048576 instead of being
+    inherited from config.json, so the estimator and readers both see it. The
+    GB200 command's --async-scheduling and --mamba-cache-mode align were left
+    off, because NVIDIA doesn't use them on Spark. They are the first knobs to
+    try for throughput. Prefix caching and chunked prefill are already on by
+    default on this build.
+
+    Parsers are the card's: qwen3_coder for tools and nemotron_v3 for
+    reasoning. The checkpoint also ships ultra_v3_reasoning_parser.py, which
+    fixes deepseek_r1-style parsing when enable_thinking is false. The card
+    doesn't use it, and this recipe doesn't either. The chat template defaults
+    enable_thinking to true and truncate_history_thinking to true. Pass
+    chat_template_kwargs {"enable_thinking": false} to turn reasoning off, or
+    {"medium_effort": true} for medium effort. Recommended sampling is
+    temperature 1.0 / top_p 0.95 for text and 0.6 / 0.95 for vision, and
+    generation_config.json carries the text values. License is OpenMDW-1.1,
+    and the repo isn't gated.
+
+    This recipe itself is unmeasured as of 2026-10-15. Its only launch was
+    stopped partway through loading, before instanttensor, the kernel config
+    and the 0.80 budget were added. The memory figures above come from the
+    LiLiCorr sibling, which shares everything except the drafter. MTP
+    acceptance and throughput are still open.
+  quantization: nvfp4
+  model_params: 120B
+  model_dtype: nvfp4
+  model_vram: 70
+  kv_dtype: fp8
+
+executor_config:
+  # The image's ENTRYPOINT is ["vllm","serve"]. This recipe runs `vllm serve`
+  # from its own command block, so the entrypoint has to be cleared. Left in
+  # place, the image parses sparkrun's launcher as its own flags and nothing
+  # starts.
+  entrypoint: ""
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.80
+  max_model_len: 1048576
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 8192
+  max_num_seqs: 1
+  block_size: 64
+  mamba_ssm_cache_dtype: float16
+  video_pruning_rate: 0.5
+  media_io_kwargs: '{"video": {"fps": 2, "num_frames": 256}}'
+  served_model_name: nemotron-3.5-super-vl
+  speculative_config: '{"method":"mtp","num_speculative_tokens":5}'
+  kernel_config: '{"linear_backend_per_quant":{"fp8_w8a8":"torch"}}'
+
+env:
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --load-format instanttensor \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kernel-config '{kernel_config}' \
+    --speculative-config '{speculative_config}' \
+    --mamba-backend flashinfer \
+    --mamba-ssm-cache-dtype {mamba_ssm_cache_dtype} \
+    --enable-mamba-cache-stochastic-rounding \
+    --mamba-cache-philox-rounds 5 \
+    --enable-mamba-shared-prefix-checkpoint \
+    --video-pruning-rate {video_pruning_rate} \
+    --media-io-kwargs '{media_io_kwargs}' \
+    --block-size {block_size} \
+    --prefix-match-unit {block_size} \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser nemotron_v3
