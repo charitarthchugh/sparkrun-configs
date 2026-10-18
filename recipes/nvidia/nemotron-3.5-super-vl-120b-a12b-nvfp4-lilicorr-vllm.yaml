@@ -1,0 +1,170 @@
+recipe_version: "2"
+model: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+runtime: vllm-distributed
+min_nodes: 1
+max_nodes: 1
+container: vllm/vllm-openai:nightly
+
+metadata:
+  description: >-
+    Sibling of nemotron-3.5-super-vl-120b-a12b-nvfp4-vllm with one change.
+    Speculative decoding uses NVIDIA's LiLiCorr drafter (dflash method, k=7)
+    instead of the checkpoint's native MTP head at k=5. Everything else is
+    identical, so the two can be benchmarked against each other directly: the
+    1,048,576-token context, the image, the Mamba flags, the fp8 kernel
+    config, the parsers and the 0.80 budget. The sibling's description has the memory arithmetic and the
+    rationale for each flag.
+
+    This is the speculative setup on the card's DGX Spark vLLM quick-start,
+    which says LiLiCorr is recommended "in all scenarios" on Spark. The
+    drafter is 1.13B trained parameters (37M of them in the LiLiCorr
+    correlation head) plus a 0.54B NVFP4 copy of the target's LM head, 1.3 GB
+    on disk. It drafts a block of 7 tokens in parallel from five of the
+    target's hidden layers, and a two-layer head correlates the top-8
+    candidates across adjacent slots. NVIDIA reports SPEED-Bench acceptance
+    length 4.74 at T=0 and 4.36 at T=1 with k=7, with coding at 5.65 and 5.29.
+
+    The deliberate departure is context. The LiLiCorr card says its serving
+    configuration "sets a 114,688-token limit", and the card's deployment
+    table pairs 1M on Spark with MTP, not LiLiCorr. Nothing on this image
+    enforces that limit, though. The drafter's config.json allows 1048576
+    positions. Every drafter layer is 8192-token sliding-window attention. On
+    nightly 3f1bcfd8 vLLM routes LiLiCorrDraftModel through the dflash method,
+    with no max_model_len check found in model_executor/models/lilicorr.py or
+    v1/worker/gpu/spec_decode/lilicorr/. So 1M is set here to match the MTP
+    sibling. The open question is whether acceptance holds deep into a long
+    context, since the drafter was trained on 4K and 8K windows. If it
+    degrades, -o max_model_len=114688 reproduces NVIDIA's configuration. The
+    drafter's own KV is bounded by its 8K window, so it adds little memory
+    beyond its 1.3 GB of weights.
+
+    The drafter is not in a distribution_config. Pre-download it with 'hf
+    download nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr'
+    (main was 7c7221ae on 2026-10-15). sparkrun sets HF_HUB_OFFLINE=1, so vLLM
+    resolves it from the local cache.
+
+    Measured 2026-10-15 on nightly 0.32.0rc1.dev190+g3f1bcfd82 with
+    --load-format instanttensor. Weights loaded in 10.91 s, plus 1.23 s for
+    the drafter, and model loading took 69.91 GiB in 22.4 s. Init engine
+    took 307.7 s, 33.1 s of that compilation, about 6 minutes from launch to
+    startup complete on a cold runtime cache. A warm relaunch took 32.3 s of
+    init engine. At the card's 0.75, available memory bottomed out at 11.6 GiB
+    and KV got 13.21 GiB (1,377,740 tokens, 1.31x the window). At 0.80
+    (97.35 GiB), weights and non-torch take 75.17 GiB, peak activation
+    2.97 GiB and CUDA graphs 0.15 GiB. That leaves 19.21 GiB of KV, holding
+    2,005,528 tokens (1.91x). Available memory bottomed out at 7.8 GiB during
+    startup and sat around 11.3 GiB after a benchmark. No memory guard was
+    running. vLLM enables prefix caching and chunked prefill by default on
+    this build.
+
+    The remaining warnings, and why each one stays:
+    - "Your GPU does not have native support for FP4": comes from the drafter
+      only, whose checkpoint is W4A16_NVFP4 (weight-only by design), so it
+      loads on MarlinNvFp4LinearKernel. The target runs native W4A4
+      (FlashInferCutlassNvFp4LinearKernel and the FLASHINFER_CUTLASS MoE).
+    - "Add 2 padding layers, may waste at most 25.00%": the drafter's 5
+      sliding-window layers set vLLM's KV group size to 5, so the target's 8
+      attention layers are padded to 10. That is 2 of 55 slots, about 3.6% of
+      the pool.
+    - "no KV cache group could be identified as the draft model's": vLLM
+      only detects drafter groups by an MLA spec flag or for trailing MTP
+      layers. LiLiCorr fits neither, so kv_cache_coordinator falls back to
+      the EAGLE last-block drop on every group. A prefix-cache hit then
+      re-prefills one 64-token block. That costs a little speed and doesn't
+      affect output.
+    - "does not support external multimodal embeddings": LiLiCorr is
+      text-only, so image prompts draft from text alone.
+    - "Using FlashInfer for draft model non-causal attention": the drafter's
+      bidirectional attention can't use TRTLLM. Informational.
+    - "Triton kernel JIT compilation during inference:
+      _prepare_dflash_inputs_kernel": a one-time spike on the first request,
+      which vLLM's warmup doesn't cover.
+    - The KV scale 1.0, q_scale and generation_config warnings are covered in
+      the sibling's description (uncalibrated fp8 KV kept on purpose, and
+      NVIDIA's recommended sampling).
+    The FlashInfer fp8_gemm autotuner warnings are gone thanks to
+    --kernel-config.
+
+    Throughput, three 1024-token prompts at T=0 with thinking off, single
+    request:
+    - FlashInfer fp8 linears at 0.75: 44.6 tok/s, acceptance 4.53.
+    - Torch fp8 linears at 0.75: 49.8 tok/s, acceptance 5.18.
+    - Torch fp8 linears at 0.80: 46.3 tok/s, acceptance 4.80.
+    The spread comes from acceptance, not the kernel. Different kernels shift
+    numerics enough to change T=0 outputs. Verify steps/s (tok/s divided by
+    acceptance) is 9.6-9.8 in all three.
+
+    Smoke test, single request at temperature 1.0 / top_p 0.95: a short
+    Python coding prompt ran out to max_tokens 4096, all of it reasoning. It
+    averaged 44.4 tok/s wall clock including prefill. Mean acceptance length
+    was 4.62 (888 drafts, 3214 of 6216 drafted tokens accepted), against
+    NVIDIA's SPEED-Bench 5.29 for coding at T=1. A tool call with
+    qwen3_coder parsed correctly (finish_reason tool_calls). Acceptance at
+    long context, and the MTP sibling's numbers for comparison, are still
+    unmeasured.
+  quantization: nvfp4
+  model_params: 120B
+  model_dtype: nvfp4
+  model_vram: 71
+  kv_dtype: fp8
+
+executor_config:
+  # The image's ENTRYPOINT is ["vllm","serve"]. This recipe runs `vllm serve`
+  # from its own command block, so the entrypoint has to be cleared. Left in
+  # place, the image parses sparkrun's launcher as its own flags and nothing
+  # starts.
+  entrypoint: ""
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.80
+  max_model_len: 1048576
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 8192
+  max_num_seqs: 1
+  block_size: 64
+  mamba_ssm_cache_dtype: float16
+  video_pruning_rate: 0.5
+  media_io_kwargs: '{"video": {"fps": 2, "num_frames": 256}}'
+  served_model_name: nemotron-3.5-super-vl
+  draft_model: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr
+  num_speculative_tokens: 7
+  kernel_config: '{"linear_backend_per_quant":{"fp8_w8a8":"torch"}}'
+
+env:
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+  CUTE_DSL_ARCH: sm_121a
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '600'
+
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
+    --tensor-parallel-size {tensor_parallel} \
+    --trust-remote-code \
+    --load-format instanttensor \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kernel-config '{kernel_config}' \
+    --speculative-config '{"method": "dflash", "model": "{draft_model}", "num_speculative_tokens": {num_speculative_tokens}}' \
+    --mamba-backend flashinfer \
+    --mamba-ssm-cache-dtype {mamba_ssm_cache_dtype} \
+    --enable-mamba-cache-stochastic-rounding \
+    --mamba-cache-philox-rounds 5 \
+    --enable-mamba-shared-prefix-checkpoint \
+    --video-pruning-rate {video_pruning_rate} \
+    --media-io-kwargs '{media_io_kwargs}' \
+    --block-size {block_size} \
+    --prefix-match-unit {block_size} \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser nemotron_v3
