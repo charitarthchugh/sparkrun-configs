@@ -84,6 +84,10 @@ description: >-
   at 58.5-59.0 tok/s with 79.8% acceptance (mean length 3.39). Tool calls
   emit a parsed tool_calls entry with finish_reason tool_calls. Mixed-traffic
   acceptance, concurrency scaling and warm-start time are unmeasured.
+  The default is now gpu_memory_utilization 0.85; the figures above were
+  measured at 0.8. The extra ~6 GiB goes to the KV pool, which should
+  leave roughly 10 GiB of host memory available, still clear of the 2 GiB
+  guard floor. The pool size and headroom at 0.85 have not been measured.
   Behaviour carried over from
   the card and base: generation_config.json sets temperature 1.0, top_p 0.95
   and top_k 20 (Qwen's thinking-mode values), tool calls use qwen3_xml with
@@ -108,7 +112,7 @@ defaults:
   tensor_parallel: 1
   pipeline_parallel: 1
   block_size: 16
-  gpu_memory_utilization: 0.8
+  gpu_memory_utilization: 0.85
   max_model_len: 262144
   kv_cache_dtype: fp8
   max_num_seqs: 8
