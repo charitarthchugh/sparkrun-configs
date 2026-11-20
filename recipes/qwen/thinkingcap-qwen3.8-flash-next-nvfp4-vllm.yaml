@@ -1,0 +1,162 @@
+recipe_version: "2"
+model: bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4
+runtime: vllm-distributed
+builder: eugr
+min_nodes: 1
+max_nodes: 1
+container: vllm-node-b12x
+description: >-
+  BottleCap AI's ThinkingCap-Qwen3.8-Flash-Next in their own NVFP4 build on a
+  single DGX Spark, serving the full native 262144-token context with fp8 KV,
+  prefix caching and the checkpoint's MTP head at k=3. ThinkingCap is a
+  post-train of Qwen3.8-Flash-Next (125B total, 6B active, plus a 51B n-gram
+  table and a 4B MTP head) that BottleCap report cuts thinking tokens by 38.5%
+  on average (22-51% by benchmark) at 88.8% average accuracy against the base
+  model's 89.8%, measured on 4x H200 in bf16 at reasoning_effort xhigh. Same
+  architecture, chat template and tokenizer as the base, so this recipe is
+  qwen3.8-flash-next-fp4-local-vllm with only the checkpoint-specific parts
+  changed. Licensed under the Qwen Community License 1.0; not gated.
+
+  The checkpoint. compressed-tensors nvfp4-pack-quantized, weight-only
+  (NVFP4A16): routed experts in all 48 layers and in the MTP head are 4-bit
+  E2M1 in groups of 16 with FP8 scales and one FP32 scale per expert
+  projection, gate and up sharing it. No calibration data was used. The
+  n-gram table is FP8 E4M3 with one per-tensor scale (ple_embedding_dtype
+  float8_e4m3fn), about 51 GB. Everything else is bf16: attention and Gated
+  DeltaNet, shared experts, routers, the vision tower, embeddings and lm_head.
+  About 132 GB on disk in 14 shards. BottleCap's own checks (2x H200, vLLM
+  0.31.0, no speculation) put accuracy inside noise of bf16 (AIME 2026 97.92%
+  vs 97.19%, RealWorldQA 85.23% vs 84.67%), with thinking 18% longer than bf16
+  on AIME, mostly on the longest problems. So the NVFP4 build gives back part
+  of the token saving that is the point of the model. Their MTP check, k=3
+  with probabilistic drafting, gave 2.76 accepted tokens per step.
+
+  Why the n-gram table has to go to disk. 132 GB does not fit in this node's
+  121.7 GiB of unified memory, and the card's default of pinning the table in
+  host RAM saves nothing here because host RAM is the same pool.
+  VLLM_PLE_TABLE_MEMORY=disk keeps the table on NVMe and has b12x's PLE reader
+  fetch rows through io_uring, as in the base recipe. It is not optional for
+  this checkpoint. Read from source in the eugr b12x image: when the variable
+  is unset, b12x defaults to io_uring only for a bf16 table and puts any other
+  dtype, this FP8 one included, on the device. That would mean about 132 GB
+  resident and an OOM. The FP8 per-tensor table layout (fp8_e4m3_per_tensor)
+  is one the b12x PLE storage handles. io_uring is why the security_opt block
+  below exists; see the base recipe for the seccomp reasoning and the trust
+  gate (run by file path or from a trusted registry).
+
+  What differs from the base recipe, and why. --quantization is omitted so
+  vLLM autodetects compressed-tensors. modelopt_mixed would be wrong for this
+  checkpoint. Per the image's source, compressed-tensors routes NVFP4 weights
+  with no input quantization to its NVFP4 MoE method with use_a16, and the
+  b12x NVFP4 MoE backend accepts A16 by synthesizing unit activation scales.
+  So --moe-backend b12x stays, and the experts should run b12x W4A16 rather
+  than Marlin. That is read from source; check the MoE backend line in the
+  serve log. The FP4-Local card's four env vars are dropped: FORCE_A16 is
+  implied by the checkpoint, A4 prefill needs activation scales this
+  checkpoint does not have, the layer-wide w13 input scale has nothing to act
+  on, and VLLM_MXFP8_LM_HEAD would re-quantize a lm_head BottleCap left bf16.
+  --linear-backend b12x and the fuse_act_quant compilation pass are dropped
+  as well, because every non-expert linear here is bf16 and nothing
+  quantizes activations. The MTP config adds draft_sample_method
+  probabilistic, which is BottleCap's own serving command. That key is in the
+  image's SpeculativeConfig. It only changes anything at temperature > 0.
+
+  Memory, estimated. The base recipe's checkpoint was 70 GiB resident. This
+  one should be about 81 GB (75 GiB) resident once the 51 GB table is on
+  disk, because its MTP head and non-expert weights stay bf16 where FP4-Local
+  uses MXFP8. At gpu_memory_utilization 0.85 (103 GiB) that leaves roughly 20+
+  GiB of KV, which is still several full 262144-token sequences at fp8 since
+  only 12 of 48 layers keep full KV. Expect sparkrun's VRAM estimate to count
+  the disk-resident table and report that the model does not fit.
+
+  Sampling and parsers. generation_config.json sets temperature 1.0, top_p
+  0.95, top_k 20, the base model's thinking-mode values, which BottleCap used
+  unchanged. The checkpoint's chat template defaults reasoning_effort to
+  xhigh. Clients can pass chat_template_kwargs reasoning_effort medium or low
+  for shorter traces. Tool calls use qwen3_xml with the qwen3 reasoning parser,
+  as in BottleCap's own vLLM command. The trace comes back in the message's
+  reasoning field. BottleCap built and tested on vLLM 0.31.0 on H200 and RTX
+  PRO 6000, not GB10, and they flag that vLLM issue #55357 (MTP acceptance
+  collapsing to zero on repetition inside the thinking) is still open for
+  this architecture.
+
+  Measured on one DGX Spark (2026-11-20, sparkrun benchmark with
+  llama-benchy 0.4.0, 2048-token prompts behind 0-64k of context, prefix
+  caching on, server-default sampling, thinking at xhigh).
+  Startup about 13 minutes; weights resident 81.45 GiB; KV pool 19.56 GiB,
+  1,061,815 tokens; host MemAvailable bottomed at 8.8 GiB. Aggregate decode
+  tok/s at concurrency 1/2/4/8 with tg 256: 34.0/54.5/74.7/93.4 at depth 0,
+  33.9/51.9/69.4/83.8 at depth 32k. That is level with
+  qwen3.8-flash-next-fp4-local-vllm at concurrency 1 and 5-15% ahead at 4 and
+  8. Prefill is within about 3% of FP4-Local (1300-2050 t/s). With 4096-token
+  outputs, single-request decode is 40.9/44.4/39.1 tok/s at depth 0/16k/64k
+  (FP4-Local 34.3/36.1/33.6), and 81.0/71.7/81.6 at concurrency 4 (FP4-Local
+  70.9/70.3/74.0), so MTP acceptance holds over a long generation. Speed
+  only; output quality was not evaluated here.
+build_args:
+  - --exp-b12x
+executor_config:
+  # b12x's disk PLE reader needs io_uring, which Docker's default seccomp
+  # profile blocks. This list replaces sparkrun's rootless default rather than
+  # merging with it, so the first two entries re-list that hardening.
+  security_opt:
+    - no-new-privileges
+    - label=disable
+    - seccomp=unconfined
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  pipeline_parallel: 1
+  block_size: 16
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+  kv_cache_dtype: fp8
+  max_num_seqs: 8
+  max_num_batched_tokens: 4096
+  served_model_name: thinkingcap-qwen3.8-flash-next
+  speculative_config: '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+env:
+  # Mandatory: for a non-bf16 (here FP8) table b12x otherwise defaults to
+  # device placement, which puts all ~132 GB in unified memory.
+  VLLM_PLE_TABLE_MEMORY: disk
+  B12X_DISK_BACKEND: io_uring
+  CUTE_DSL_ARCH: sm_121a
+  SAFETENSORS_FAST_GPU: '1'
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_USE_AOT_COMPILE: '1'
+  VLLM_USE_MEGA_AOT_ARTIFACT: '1'
+  VLLM_USE_V2_MODEL_RUNNER: '1'
+  B12X_POLICY_MODE: auto
+  MAX_JOBS: '2'
+  NVCC_THREADS: '2'
+  FLASHINFER_NVCC_THREADS: '2'
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --served-model-name {served_model_name} \
+    --enable-prompt-tokens-details \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --mamba-cache-mode align \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --dtype bfloat16 \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --block-size {block_size} \
+    --load-format b12x \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative-config '{speculative_config}' \
+    --gdn-decode-kernel b12x \
+    --moe-backend b12x \
+    --no-enable-flashinfer-autotune \
+    --mm-encoder-tp-mode data \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_xml \
+    --enable-auto-tool-choice \
+    --gpu-memory-utilization {gpu_memory_utilization}
